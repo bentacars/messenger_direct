@@ -1,153 +1,115 @@
-import fetch from 'node-fetch';
-
-/* ================== Inventory fetch ================== */
-export async function fetchInventory() {
-  const url = process.env.INVENTORY_ENDPOINT;
-  if (!url) throw new Error('INVENTORY_ENDPOINT not set');
-  const r = await fetch(url);
-  const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(`Inventory fetch failed: ${r.status}`);
-  if (Array.isArray(j.items)) return j.items;
-  if (Array.isArray(j.data))  return j.data;
-  if (Array.isArray(j))       return j;
-  return [];
-}
-
-/* ================== Utils ================== */
-const STATIC_TOKENS = [
-  'suv','sedan','mpv','hatchback','pickup','van','vios','fortuner','innova','terra','xpander','stargazer',
-  'l300','hiace','grandia','commuter','urvan','nv350','avanza','altis','wigo','brv','br-v','brio',
-  'civic','city','accent','elantra','everest','ranger','traviz','carry','k2500'
-];
-
-const asNum = v => {
-  if (v == null) return null;
-  const n = Number(String(v).replace(/[^\d.]/g,''));
-  return isFinite(n) ? n : null;
-};
-
-/* ---------- Image helpers (use your already-converted links) ---------- */
-export function imageList(row, start = 1, end = 10) {
-  const list = [];
-  for (let i = start; i <= end; i++) {
-    const k = `image_${i}`;
-    const v = row?.[k];
-    if (v && String(v).trim()) list.push(String(v).trim());
+// /api/lib/matching.js
+export function normalizeRow(r) {
+  // Collect image_1..image_10 into an array (skip blanks)
+  const images = [];
+  for (let i = 1; i <= 10; i++) {
+    const v = r[`image_${i}`];
+    if (v && String(v).trim()) images.push(String(v).trim());
   }
-  return list;
-}
-
-export function firstFiveImages(row) {
-  return imageList(row, 1, 5);   // send on offer
-}
-
-export function extraImages(row) {
-  return imageList(row, 6, 10);  // send when buyer asks for more
-}
-
-function tokensFromInventory(inv) {
-  const set = new Set(STATIC_TOKENS);
-  for (const r of inv) {
-    const s = [r?.brand, r?.model, r?.variant, r?.brand_model]
-      .filter(Boolean)
-      .join(' ')
-      .toLowerCase();
-    s.split(/[^a-z0-9\-]+/i).forEach(t => { if (t && t.length >= 3) set.add(t); });
-  }
-  return Array.from(set);
-}
-
-/* ================== Wants extraction ================== */
-export function extractWants(history, inventory) {
-  const text = history.map(m => m.content).join(' ').toLowerCase();
-  const wants = {
-    payment: /financ/i.test(text) ? 'financing' : (/cash/i.test(text) ? 'cash' : null),
-    cash_budget_min: null, cash_budget_max: null,
-    dp_min: null, dp_max: null,
-    city: null, province: null,
-    preferred_type_or_model: null
+  return {
+    sku: r.SKU || r.sku || r.Sku || "",
+    plate_number: r.plate_number || "",
+    year: r.year || "",
+    brand: r.brand || "",
+    model: r.model || "",
+    variant: r.variant || "",
+    transmission: r.transmission || "",
+    fuel_type: r.fuel_type || "",
+    body_type: r.body_type || "",
+    color: r.color || "",
+    mileage: r.mileage || r.km || "",
+    video_link: r.video_link || "",
+    drive_link: r.drive_link || "",
+    dealer_price: num(r.dealer_price),
+    srp: num(r.srp),
+    all_in: num(r.all_in || r.price_all_in),
+    price_status: (r.price_status || "").toString(),
+    complete_address: r.complete_address || "",
+    city: r.city || "",
+    province: r.province || "",
+    ncr_zone: r.ncr_zone || "",
+    brand_model: r.brand_model || "",
+    search_key: r.search_key || "",
+    images,
+    has_images: images.length > 0
   };
+}
 
-  // cash range: "400k-500k"
-  const range = text.match(/(\d[\d,\.]*)\s*[-–]\s*(\d[\d,\.]*)/);
-  if (range && wants.payment === 'cash') {
-    const a = asNum(range[1]), b = asNum(range[2]);
-    if (a && b) { wants.cash_budget_min = Math.min(a,b); wants.cash_budget_max = Math.max(a,b); }
-  } else if (wants.payment === 'cash') {
-    const one = text.match(/(?:budget|cash)\D{0,8}(\d[\d,\.]*)/);
-    const v = one && asNum(one[1]);
-    if (v) { wants.cash_budget_min = v*0.9; wants.cash_budget_max = v*1.1; }
+function num(v) {
+  if (v == null) return null;
+  const n = Number(String(v).replace(/[₱, ]/g, ""));
+  return Number.isFinite(n) ? n : null;
+}
+
+function score(row, want) {
+  let s = 0;
+
+  // Model / brand_model
+  if (want.model && row.model) {
+    if (row.model.toLowerCase().includes(want.model.toLowerCase())) s += 6;
+  }
+  if (want.brand && row.brand) {
+    if (row.brand.toLowerCase().includes(want.brand.toLowerCase())) s += 3;
   }
 
-  // financing DP: "dp 120k"
-  const dp = text.match(/(?:dp|down ?payment)[^\d]{0,8}(\d[\d,\.]*)/);
-  const dv = dp && asNum(dp[1]);
-  if (dv && wants.payment === 'financing') { wants.dp_min = dv*0.9; wants.dp_max = dv*1.1; }
-
-  // simple city detect
-  const cityHit = text.match(/\b(quezon city|qc|manila|makati|pasig|pasay|taguig|mandaluyong|marikina|caloocan|antipolo|cebu|davao|cavite|parañaque|las piñas|muntinlupa)\b/);
-  if (cityHit) wants.city = cityHit[0];
-
-  // model/type detection (static + dynamic)
-  const dyn = tokensFromInventory(inventory);
-  wants.preferred_type_or_model = dyn.find(t => text.includes(t)) || null;
-
-  return wants;
-}
-
-export function relaxWants(w) {
-  const c = { ...w };
-  if (c.cash_budget_min != null) c.cash_budget_min *= 0.85;
-  if (c.cash_budget_max != null) c.cash_budget_max *= 1.25;
-  if (c.dp_min != null)          c.dp_min          *= 0.85;
-  if (c.dp_max != null)          c.dp_max          *= 1.25;
-  c.city = null; // relax city constraint
-  return c;
-}
-
-/* ================== Scoring & ranking ================== */
-function scoreRow(r, w) {
-  const n = s => (s ?? '').toString().trim().toLowerCase();
-  const srp   = asNum(r.srp ?? r.price);
-  const allIn = asNum(r.all_in);
-  let score = 0;
-
-  if (w.payment === 'cash' && srp != null && w.cash_budget_min != null && w.cash_budget_max != null) {
-    score += (srp >= w.cash_budget_min && srp <= w.cash_budget_max) ? 60
-          :  (srp >= w.cash_budget_min*0.9 && srp <= w.cash_budget_max*1.1) ? 40 : 0;
-  }
-  if (w.payment === 'financing' && allIn != null && w.dp_min != null && w.dp_max != null) {
-    score += (allIn >= w.dp_min && allIn <= w.dp_max) ? 60
-          :  (allIn >= w.dp_min*0.9 && allIn <= w.dp_max*1.1) ? 40 : 0;
+  // Transmission
+  if (want.transmission && row.transmission) {
+    if (row.transmission.toLowerCase().startsWith(want.transmission.toLowerCase())) s += 3;
   }
 
-  const city = n(r.city), prov = n(r.province);
-  if (w.city && city && city === n(w.city)) score += 20;
-  else if (w.province && prov && prov === n(w.province)) score += 12;
+  // Body type
+  if (want.body_type && row.body_type) {
+    if (row.body_type.toLowerCase().includes(want.body_type.toLowerCase())) s += 2;
+  }
 
-  const blob = [r.brand, r.model, r.variant, r.body_type].map(x => n(x)).join(' ');
-  if (w.preferred_type_or_model && blob.includes(n(w.preferred_type_or_model))) score += 15;
+  // Budget logic:
+  if (want.payment === "cash" && want.cash_budget && row.srp) {
+    const diff = Math.abs(row.srp - want.cash_budget);
+    s += diff === 0 ? 5 : Math.max(0, 5 - diff / 50000); // softer curve
+  }
+  if (want.payment === "financing" && want.cash_out && row.all_in) {
+    const diff = Math.abs(row.all_in - want.cash_out);
+    s += diff === 0 ? 5 : Math.max(0, 5 - diff / 30000);
+  }
 
-  const yr = Number(r.year) || 0;
-  score += Math.min(Math.max(yr - 2000, 0), 5) * 0.5;
+  // Location nudge
+  if (want.city && row.city) {
+    if (row.city.toLowerCase().includes(want.city.toLowerCase())) s += 2;
+  }
+  if (want.province && row.province) {
+    if (row.province.toLowerCase().includes(want.province.toLowerCase())) s += 1;
+  }
 
-  return score;
+  // Images available
+  if (row.has_images) s += 2;
+
+  return s;
 }
 
-export function rankMatches(rows, wants) {
-  return rows.map(r => ({ score: scoreRow(r, wants), row: r }))
-             .sort((a,b) => b.score - a.score)
-             .map(x => x.row);
-}
+export function pickTopTwo(rawRows, want) {
+  const rows = rawRows.map(normalizeRow);
 
-export function cardText(row, wants) {
-  const brand = row.brand || '';
-  const model = row.model || '';
-  const variant = row.variant || '';
-  const year = row.year || '';
-  const city = row.city || '';
-  const mileage = row.mileage ? `${row.mileage} km` : '';
-  const priceLabel = wants.payment === 'financing' ? 'All-in' : 'Price';
-  const priceVal   = wants.payment === 'financing' ? (row.all_in ?? row.srp ?? '') : (row.srp ?? row.price ?? '');
-  return `${year} ${brand} ${model} ${variant}\n${priceLabel}: ₱${priceVal}\n${city}${mileage ? ' — ' + mileage : ''}`;
+  // Compute scores
+  const scored = rows
+    .map(r => ({ r, s: score(r, want) }))
+    .sort((a, b) => b.s - a.s);
+
+  if (scored.length === 0) return [];
+
+  const isPriority = x => (x.r.price_status || "").toLowerCase().includes("priority");
+
+  // 1) Take best PRIORITY (if any)
+  const pri = scored.find(isPriority);
+
+  // 2) Then take next-best overall (excluding chosen)
+  const top = [];
+  if (pri) top.push(pri);
+  for (const it of scored) {
+    if (top.length >= 2) break;
+    if (pri && it.r.sku === pri.r.sku) continue;
+    top.push(it);
+  }
+
+  // return plain rows in order
+  return top.map(it => it.r);
 }
