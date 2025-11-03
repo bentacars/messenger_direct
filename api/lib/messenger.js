@@ -1,38 +1,58 @@
+// /api/lib/messenger.js
 import fetch from 'node-fetch';
 
-const FB_URL = 'https://graph.facebook.com/v18.0/me/messages';
+const PAGE_TOKEN = process.env.FB_PAGE_TOKEN;
 
 export async function sendText(psid, text) {
-  const r = await fetch(`${FB_URL}?access_token=${process.env.FB_PAGE_TOKEN}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ messaging_type: 'RESPONSE', recipient: { id: psid }, message: { text } })
+  return callSendAPI({
+    recipient: { id: psid },
+    message: { text }
   });
-  if (!r.ok) console.error('sendText error', r.status, await r.text());
 }
 
-export async function sendQuickReplies(psid, text, replies) {
-  const body = {
-    messaging_type: 'RESPONSE',
+export async function sendButtons(psid, text, buttons) {
+  return callSendAPI({
     recipient: { id: psid },
     message: {
-      text,
-      quick_replies: replies.map(t => ({ content_type: 'text', title: t, payload: t }))
+      attachment: {
+        type: "template",
+        payload: {
+          template_type: "button",
+          text,
+          buttons
+        }
+      }
     }
-  };
-  const r = await fetch(`${FB_URL}?access_token=${process.env.FB_PAGE_TOKEN}`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
   });
-  if (!r.ok) console.error('quickReplies error', r.status, await r.text());
 }
 
-export async function sendImage(psid, imageUrl) {
-  const body = {
+export async function sendImage(psid, url) {
+  return callSendAPI({
     recipient: { id: psid },
-    message: { attachment: { type: 'image', payload: { url: imageUrl, is_reusable: false } } }
-  };
-  const r = await fetch(`${FB_URL}?access_token=${process.env.FB_PAGE_TOKEN}`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+    message: {
+      attachment: {
+        type: "image",
+        payload: { url }
+      }
+    }
   });
-  if (!r.ok) console.error('sendImage error', r.status, await r.text());
+}
+
+export async function sendImagesSequential(psid, urls) {
+  for (const u of urls) {
+    await sendImage(psid, u);
+  }
+}
+
+async function callSendAPI(body) {
+  const res = await fetch(`https://graph.facebook.com/v17.0/me/messages?access_token=${PAGE_TOKEN}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) {
+    const msg = await res.text().catch(() => res.statusText);
+    console.error("Send API error:", res.status, msg);
+  }
+  return res.ok;
 }
