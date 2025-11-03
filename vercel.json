@@ -1,8 +1,11 @@
 {
-  "version": 2,
-  "functions": {
-    "api/**/*.js": {
-      "runtime": "nodejs18.x"
-    }
+  "name": "messenger_direct",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "node-fetch": "3.x"
+  },
+  "scripts": {
+    "build": "echo no-build"
   }
 }
