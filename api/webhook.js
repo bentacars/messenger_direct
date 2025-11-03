@@ -83,7 +83,13 @@ async function fetchInventoryFromAppsScript() {
   return Array.isArray(j.items) ? j.items : [];
 }
 
-/* Extract rough buyer wants from the chat history (lite) */
+/* ===== Utilities for wants, relax, scoring ===== */
+const MODEL_TOKENS = [
+  'suv','sedan','mpv','hatchback','pickup','van','vios','fortuner','innova','terra',
+  'xpander','stargazer','l300','hiace','grandia','commuter','urvan','nv350','avanza','altis',
+  'wigo','brv','br-v','brio','civic','city','accent','elantra','everest','ranger'
+];
+
 function extractWants(history) {
   const text = history.map(m => m.content).join(' ').toLowerCase();
 
@@ -122,13 +128,28 @@ function extractWants(history) {
   if (cityHit) want.city = cityHit[0];
 
   // body type or model keywords
-  const typeHit = text.match(/\b(suv|sedan|mpv|hatchback|pickup|van|vios|fortuner|innova|terra|xpander|stargazer|l300)\b/);
-  if (typeHit) want.preferred_type_or_model = typeHit[0];
+  const typeHit = MODEL_TOKENS.find(t => text.includes(t));
+  if (typeHit) want.preferred_type_or_model = typeHit;
 
   return want;
 }
 
-/* Score + sort matches */
+function relaxWants(w) {
+  const clone = { ...w };
+  // widen budgets by 25%
+  if (clone.cash_budget_min != null) clone.cash_budget_min *= 0.85;
+  if (clone.cash_budget_max != null) clone.cash_budget_max *= 1.25;
+  if (clone.dp_min != null) clone.dp_min *= 0.85;
+  if (clone.dp_max != null) clone.dp_max *= 1.25;
+  // ignore exact city constraint, keep province/model hints
+  clone.city = null;
+  return clone;
+}
+
+function isAffirmation(text) {
+  return /^(yes|yep|sure|sige|ok|okay|game|go ahead|go|sya|opo|oo)\b/i.test(text.trim());
+}
+
 function rankMatches(rows, want) {
   const n = s => (s ?? '').toString().trim().toLowerCase();
   const num = v => {
@@ -144,7 +165,7 @@ function rankMatches(rows, want) {
     const model = n(r.model);
     const variant = n(r.variant);
     const price = num(r.srp ?? r.price);
-    const dp = num(r.dp); // only if your JSON has a dp column; otherwise ignored
+    const dp = num(r.dp); // optional
 
     let score = 0;
 
@@ -181,11 +202,9 @@ function rankMatches(rows, want) {
   .map(x => x.row);
 }
 
-/* Compact text output (don’t expose internal fields) */
 function formatMatches(rows, limit = 3) {
   const pick = rows.slice(0, limit);
-  if (!pick.length) return 'Walang exact match. Okay ba i-expand ng konti ang budget or nearby cities para may maipakita ako?';
-
+  if (!pick.length) return '';
   return pick.map(r => {
     const brand = r.brand || '';
     const model = r.model || '';
@@ -196,6 +215,36 @@ function formatMatches(rows, limit = 3) {
     const mileage = r.mileage ? `${r.mileage} km` : '';
     return `• ${brand} ${model} ${variant} ${year} — ₱${price} — ${city}${mileage ? ' — ' + mileage : ''}`;
   }).join('\n');
+}
+
+/* Run matching once; if no results and relax=true, it retries with relaxed wants */
+async function runMatchingAndReply(psid, history, { relax = false } = {}) {
+  const all = await fetchInventoryFromAppsScript();
+  const wants = relax ? relaxWants(extractWants(history)) : extractWants(history);
+  const ranked = rankMatches(all, wants);
+  const list = formatMatches(ranked, 3);
+
+  if (list) {
+    const intro = relax
+      ? 'Nag-loosen ako ng criteria para may maipakita:'
+      : 'Ito yung best na swak sa budget/location mo para di ka na mag-scroll:';
+    await sendToMessenger(psid, `${intro}\n${list}`);
+    return true;
+  }
+
+  if (!relax) {
+    // first try failed; ask permission to relax
+    await sendToMessenger(
+      psid,
+      'Walang exact match. Okay ba i-expand nang konti ang budget or nearby cities para may maipakita ako?'
+    );
+  } else {
+    await sendToMessenger(
+      psid,
+      'Wala pa rin akong makita na pasok. Pwede tayong maghanap sa mas malawak na options o ibang model.'
+    );
+  }
+  return false;
 }
 
 /* ========= Webhook handler ========= */
@@ -222,17 +271,27 @@ export default async function handler(req, res) {
           const psid = event?.sender?.id;
           if (!psid) continue;
 
-          const text =
+          const userText =
             event?.message?.text ||
             event?.postback?.title ||
             '';
-          if (!text) continue;
+          if (!userText) continue;
 
           // Update convo
           const hist = historyFor(psid);
-          hist.push({ role: 'user', content: text });
+          hist.push({ role: 'user', content: userText });
 
-          // Ask OpenAI
+          // If user affirmed (yes/sure/etc), do relaxed matching immediately
+          if (isAffirmation(userText)) {
+            try {
+              await runMatchingAndReply(psid, hist, { relax: true });
+            } catch (e) {
+              console.error('Relaxed matching error:', e);
+            }
+            // still continue to LLM so it can acknowledge naturally
+          }
+
+          // Ask OpenAI for the conversational reply
           const reply = await sendToOpenAI(hist);
           if (!reply) continue;
 
@@ -243,15 +302,11 @@ export default async function handler(req, res) {
           // Send back to Messenger
           await sendToMessenger(psid, reply);
 
-          // If Phase-1 complete, run matching and send short list
+          // If Phase-1 completed, do a strict matching pass
           if (reply.includes(STOP_LINE)) {
             try {
-              const wants = extractWants(hist);
-              const all = await fetchInventoryFromAppsScript();
-              const ranked = rankMatches(all, wants);
-              const list = formatMatches(ranked, 3);
-              const intro = 'Ito yung best na swak sa budget/location mo para di ka na mag-scroll:';
-              await sendToMessenger(psid, `${intro}\n${list}`);
+              const ok = await runMatchingAndReply(psid, hist, { relax: false });
+              // If strict had no results, the earlier affirmation branch may handle relax
             } catch (e) {
               console.error('Matching error:', e);
               await sendToMessenger(psid, 'Nagkaproblema sa paghanap ng units. Subukan natin ulit mamaya or i-tweak natin criteria.');
