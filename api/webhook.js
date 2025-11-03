@@ -19,7 +19,11 @@ const QUALIFIER_PROMPT = await readFile(
 );
 
 /* ========= In-memory session store (OK for now) ========= */
+// chat history for LLM
 const sessions = new Map();
+// ui state for selection/scheduling
+const uiState = new Map(); // { stage, lastMatches, selectedIndex, selectedUnit, schedule: {when, phone} }
+
 function historyFor(senderId) {
   if (!sessions.has(senderId)) {
     sessions.set(senderId, [
@@ -32,6 +36,10 @@ function clampHistory(arr) {
   const systemMsg = arr[0];
   const tail = arr.slice(-MAX_TURNS * 2);
   return [systemMsg, ...tail];
+}
+function stateFor(psid) {
+  if (!uiState.has(psid)) uiState.set(psid, { stage: 'idle' });
+  return uiState.get(psid);
 }
 
 /* ========= OpenAI + Messenger helpers ========= */
@@ -71,6 +79,50 @@ async function sendToMessenger(psid, text) {
   if (!r.ok) {
     const msg = await r.text();
     console.error('Messenger Send API error:', r.status, msg);
+  }
+}
+
+async function sendQuickReplies(psid, text, replies) {
+  const url = `https://graph.facebook.com/v18.0/me/messages?access_token=${process.env.FB_PAGE_TOKEN}`;
+  const body = {
+    messaging_type: 'RESPONSE',
+    recipient: { id: psid },
+    message: {
+      text,
+      quick_replies: replies.map(t => ({ content_type: 'text', title: t, payload: t }))
+    }
+  };
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  if (!r.ok) {
+    const msg = await r.text();
+    console.error('Messenger Quick Replies error:', r.status, msg);
+  }
+}
+
+async function sendImage(psid, imageUrl) {
+  if (!imageUrl) return;
+  const url = `https://graph.facebook.com/v18.0/me/messages?access_token=${process.env.FB_PAGE_TOKEN}`;
+  const body = {
+    recipient: { id: psid },
+    message: {
+      attachment: {
+        type: 'image',
+        payload: { url: imageUrl, is_reusable: false }
+      }
+    }
+  };
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  if (!r.ok) {
+    const msg = await r.text();
+    console.error('Messenger Image error:', r.status, msg);
   }
 }
 
@@ -136,18 +188,18 @@ function extractWants(history) {
 
 function relaxWants(w) {
   const clone = { ...w };
-  // widen budgets by 25%
+  // widen budgets by ~25%
   if (clone.cash_budget_min != null) clone.cash_budget_min *= 0.85;
   if (clone.cash_budget_max != null) clone.cash_budget_max *= 1.25;
   if (clone.dp_min != null) clone.dp_min *= 0.85;
   if (clone.dp_max != null) clone.dp_max *= 1.25;
-  // ignore exact city constraint, keep province/model hints
+  // relax city (keep province/model)
   clone.city = null;
   return clone;
 }
 
 function isAffirmation(text) {
-  return /^(yes|yep|sure|sige|ok|okay|game|go ahead|go|sya|opo|oo)\b/i.test(text.trim());
+  return /^(yes|yep|sure|sige|ok|okay|game|go ahead|go|opo|oo|ayos|tara)\b/i.test(text.trim());
 }
 
 function rankMatches(rows, want) {
@@ -205,7 +257,7 @@ function rankMatches(rows, want) {
 function formatMatches(rows, limit = 3) {
   const pick = rows.slice(0, limit);
   if (!pick.length) return '';
-  return pick.map(r => {
+  return pick.map((r, i) => {
     const brand = r.brand || '';
     const model = r.model || '';
     const variant = r.variant || '';
@@ -213,38 +265,16 @@ function formatMatches(rows, limit = 3) {
     const price = r.srp ?? r.price ?? '';
     const city = r.city || '';
     const mileage = r.mileage ? `${r.mileage} km` : '';
-    return `• ${brand} ${model} ${variant} ${year} — ₱${price} — ${city}${mileage ? ' — ' + mileage : ''}`;
+    return `${i+1}. ${brand} ${model} ${variant} ${year} — ₱${price} — ${city}${mileage ? ' — ' + mileage : ''}`;
   }).join('\n');
 }
 
 /* Run matching once; if no results and relax=true, it retries with relaxed wants */
-async function runMatchingAndReply(psid, history, { relax = false } = {}) {
+async function runMatching(psid, history, { relax = false } = {}) {
   const all = await fetchInventoryFromAppsScript();
   const wants = relax ? relaxWants(extractWants(history)) : extractWants(history);
   const ranked = rankMatches(all, wants);
-  const list = formatMatches(ranked, 3);
-
-  if (list) {
-    const intro = relax
-      ? 'Nag-loosen ako ng criteria para may maipakita:'
-      : 'Ito yung best na swak sa budget/location mo para di ka na mag-scroll:';
-    await sendToMessenger(psid, `${intro}\n${list}`);
-    return true;
-  }
-
-  if (!relax) {
-    // first try failed; ask permission to relax
-    await sendToMessenger(
-      psid,
-      'Walang exact match. Okay ba i-expand nang konti ang budget or nearby cities para may maipakita ako?'
-    );
-  } else {
-    await sendToMessenger(
-      psid,
-      'Wala pa rin akong makita na pasok. Pwede tayong maghanap sa mas malawak na options o ibang model.'
-    );
-  }
-  return false;
+  return ranked;
 }
 
 /* ========= Webhook handler ========= */
@@ -277,36 +307,125 @@ export default async function handler(req, res) {
             '';
           if (!userText) continue;
 
-          // Update convo
-          const hist = historyFor(psid);
-          hist.push({ role: 'user', content: userText });
+          const state = stateFor(psid);
 
-          // If user affirmed (yes/sure/etc), do relaxed matching immediately
-          if (isAffirmation(userText)) {
+          /* ===== Phase 3: handle selection/scheduling states first ===== */
+          if (state.stage === 'awaiting_selection') {
+            const pickedNum = parseInt(userText.trim(), 10);
+            if (Number.isFinite(pickedNum) && pickedNum >= 1 && pickedNum <= (state.lastMatches?.length || 0)) {
+              state.selectedIndex = pickedNum - 1;
+              state.selectedUnit = state.lastMatches[state.selectedIndex];
+              // show one photo + short card + schedule CTA
+              const u = state.selectedUnit;
+              if (u?.image_1) await sendImage(psid, u.image_1);
+              const card = `${u.brand || ''} ${u.model || ''} ${u.variant || ''} ${u.year || ''}\n` +
+                           `₱${u.srp ?? ''} — ${u.city || ''}${u.mileage ? ' — ' + u.mileage + ' km' : ''}`;
+              await sendQuickReplies(psid,
+                `Nice choice! ✅\n${card}\n\nGusto mo bang i-schedule ang viewing?`,
+                ['Schedule viewing', 'Show other units']
+              );
+              state.stage = 'after_choice';
+              uiState.set(psid, state);
+              continue;
+            }
+            if (/see more|more|iba pa/i.test(userText)) {
+              // (future) pagination
+              await sendToMessenger(psid, 'Sige, dadagdagan pa natin soon ang list. For now, pili ka muna sa 1–3.');
+              continue;
+            }
+          } else if (state.stage === 'after_choice') {
+            if (/schedule/i.test(userText)) {
+              await sendToMessenger(psid, 'Great! Anong preferred **date & time** mo? (e.g., "Fri 3pm" or "Nov 8, 2pm")');
+              state.stage = 'awaiting_when';
+              uiState.set(psid, state);
+              continue;
+            }
+            if (/show other|iba/i.test(userText)) {
+              await sendToMessenger(psid, 'Noted. Pili ka ulit mula sa list, or sabihin mo kung anong model ang gusto mo.');
+              state.stage = 'awaiting_selection';
+              uiState.set(psid, state);
+              continue;
+            }
+          } else if (state.stage === 'awaiting_when') {
+            state.schedule = state.schedule || {};
+            state.schedule.when = userText.trim();
+            await sendToMessenger(psid, 'Got it. Pakibigay din po ang **mobile number** para ma-confirm ng branch (e.g., 0917xxxxxxx).');
+            state.stage = 'awaiting_phone';
+            uiState.set(psid, state);
+            continue;
+          } else if (state.stage === 'awaiting_phone') {
+            state.schedule.phone = userText.trim();
+            const u = state.selectedUnit || {};
+            const summary =
+              `✅ Tentative viewing set!\n` +
+              `Unit: ${u.brand || ''} ${u.model || ''} ${u.variant || ''} ${u.year || ''}\n` +
+              `Price: ₱${u.srp ?? ''}\n` +
+              `When: ${state.schedule.when}\n` +
+              `Buyer mobile: ${state.schedule.phone}\n` +
+              `Location: ${u.complete_address || u.city || 'branch to confirm'}`;
+            await sendToMessenger(psid, summary);
+            await sendToMessenger(psid, 'Our team will confirm the exact branch schedule. Anything else you’d like to check?');
+
+            // TODO: push to your ops channel (Telegram/Sheets/Email)
+            state.stage = 'idle';
+            uiState.set(psid, state);
+            continue;
+          }
+
+          /* ===== If user says "yes/sure" after no-match, do relaxed matching immediately ===== */
+          if (isAffirmation(userText) && state.stage === 'idle' && state.lastAskedNoMatch) {
             try {
-              await runMatchingAndReply(psid, hist, { relax: true });
+              const hist = historyFor(psid);
+              const ranked = await runMatching(psid, hist, { relax: true });
+              if (ranked.length) {
+                const list = formatMatches(ranked, 3);
+                await sendToMessenger(psid, 'Nag-loosen ako ng criteria para may maipakita:');
+                await sendToMessenger(psid, list);
+                await sendQuickReplies(psid, 'Anong number ang pipiliin mo?', ['1', '2', '3', 'See more']);
+                state.lastMatches = ranked.slice(0, 3);
+                state.stage = 'awaiting_selection';
+                state.lastAskedNoMatch = false;
+                uiState.set(psid, state);
+              } else {
+                await sendToMessenger(psid, 'Wala pa rin akong makita na pasok. Pwede tayong maghanap ng ibang model or ibang budget.');
+              }
             } catch (e) {
               console.error('Relaxed matching error:', e);
             }
-            // still continue to LLM so it can acknowledge naturally
+            // continue to LLM acknowledge
           }
 
-          // Ask OpenAI for the conversational reply
+          /* ===== Phase 1: LLM conversation ===== */
+          const hist = historyFor(psid);
+          hist.push({ role: 'user', content: userText });
+
           const reply = await sendToOpenAI(hist);
-          if (!reply) continue;
+          if (reply) {
+            hist.push({ role: 'assistant', content: reply });
+            sessions.set(psid, clampHistory(hist));
+            await sendToMessenger(psid, reply);
+          }
 
-          // Save AI reply + clamp
-          hist.push({ role: 'assistant', content: reply });
-          sessions.set(psid, clampHistory(hist));
-
-          // Send back to Messenger
-          await sendToMessenger(psid, reply);
-
-          // If Phase-1 completed, do a strict matching pass
-          if (reply.includes(STOP_LINE)) {
+          /* ===== Phase 2: once qualifier finishes, run matching ===== */
+          if (reply && reply.includes(STOP_LINE)) {
             try {
-              const ok = await runMatchingAndReply(psid, hist, { relax: false });
-              // If strict had no results, the earlier affirmation branch may handle relax
+              const ranked = await runMatching(psid, hist, { relax: false });
+              if (ranked.length) {
+                const list = formatMatches(ranked, 3);
+                await sendToMessenger(psid, 'Ito yung best na swak sa budget/location mo para di ka na mag-scroll:');
+                await sendToMessenger(psid, list);
+                await sendQuickReplies(psid, 'Anong number ang pipiliin mo?', ['1', '2', '3', 'See more']);
+                const st = stateFor(psid);
+                st.lastMatches = ranked.slice(0, 3);
+                st.stage = 'awaiting_selection';
+                st.lastAskedNoMatch = false;
+                uiState.set(psid, st);
+              } else {
+                await sendToMessenger(psid, 'Walang exact match. Okay ba i-expand ng konti ang budget or nearby cities para may maipakita ako?');
+                const st = stateFor(psid);
+                st.lastAskedNoMatch = true;
+                uiState.set(psid, st);
+              }
             } catch (e) {
               console.error('Matching error:', e);
               await sendToMessenger(psid, 'Nagkaproblema sa paghanap ng units. Subukan natin ulit mamaya or i-tweak natin criteria.');
