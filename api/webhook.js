@@ -4,7 +4,7 @@ const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
 const MODEL = 'gpt-4o-mini';
 const MAX_TURNS = 18; // ~18 turns memory per user
 
-// Simple in-memory sessions (good for initial test)
+// Simple in-memory sessions (OK for initial test)
 const sessions = new Map();
 
 function historyFor(senderId) {
@@ -85,7 +85,7 @@ async function sendToMessenger(psid, text) {
 }
 
 export default async function handler(req, res) {
-  // Webhook verification
+  // --- Verify webhook (GET) ---
   if (req.method === 'GET') {
     const mode = req.query['hub.mode'];
     const token = req.query['hub.verify_token'];
@@ -96,11 +96,11 @@ export default async function handler(req, res) {
     return res.status(403).send('Forbidden');
   }
 
-  // Incoming messages
+  // --- Handle messages (POST) ---
   if (req.method === 'POST') {
     try {
       const body = req.body;
-      if (body.object !== 'page') return res.sendStatus(404);
+      if (body.object !== 'page') return res.status(404).send('Not a page subscription');
 
       for (const entry of body.entry || []) {
         for (const event of entry.messaging || []) {
@@ -126,14 +126,15 @@ export default async function handler(req, res) {
           await sendToMessenger(psid, reply);
         }
       }
-      return res.sendStatus(200);
+      return res.status(200).send('OK');
     } catch (err) {
       console.error('Webhook error:', err);
-      return res.sendStatus(500);
+      return res.status(500).send('Server error');
     }
   }
 
   return res.status(405).send('Method Not Allowed');
 }
 
+// Ensure JSON body parsing is enabled on Vercel Node functions
 export const config = { api: { bodyParser: true } };
