@@ -1,172 +1,219 @@
 // /api/webhook.js
-import { sendText, sendQuickReplies, sendImage } from './lib/messenger.js';
-import {
-  fetchInventory, extractWants, relaxWants, rankMatches,
-  firstFiveImages, extraImages, cardText
-} from './lib/matching.js';
-import { qualifierPrompt, chat, STOP_LINE } from './lib/llm.js';
+import fetch from 'node-fetch';
+import { pickTopTwo } from './lib/matching.js';
+import { sendText, sendButtons, sendImage, sendImagesSequential } from './lib/messenger.js';
 
-const MAX_TURNS = 18;
-const sessions = new Map();  // per-user chat history
-const uiState  = new Map();  // per-user UI state (selection/schedule)
+// ---------- ENV ----------
+const VERIFY_TOKEN = process.env.FB_VERIFY_TOKEN;
+const INVENTORY_API = process.env.INVENTORY_API_URL;
+const MODEL = process.env.MODEL || 'gpt-4.1';
+const TEMPERATURE = Number(process.env.TEMPERATURE ?? 0.30);
 
-// ---- helpers ----
-function historyFor(psid, sys) {
-  if (!sessions.has(psid)) sessions.set(psid, [{ role: 'system', content: sys }]);
-  return sessions.get(psid);
+// ---------- Simple in-memory session store ----------
+const SESS = new Map();
+/*
+SESS.set(psid, {
+  want: {payment, model, brand, body_type, transmission, cash_budget, cash_out, city, province},
+  candidates: [row,row],
+  pickedIndex: null
+})
+*/
+
+// Minimal NLU helpers (keep it light for now)
+function extractPickNumber(text) {
+  const m = String(text).match(/\b(?:#?\s*(\d+)|number\s*(\d+))\b/i);
+  if (!m) return null;
+  const n = Number(m[1] || m[2]);
+  return Number.isFinite(n) ? n : null;
 }
-function clamp(arr){ const sys=arr[0]; const tail=arr.slice(-MAX_TURNS*2); return [sys,...tail]; }
-function stateFor(psid){ if(!uiState.has(psid)) uiState.set(psid,{stage:'idle'}); return uiState.get(psid); }
-const yes = t => /^(yes|yep|sure|sige|ok|okay|game|go|opo|oo|ayos|tara)\b/i.test((t||'').trim());
-async function sendImages(psid, urls = []) { for (const u of urls) await sendImage(psid, u); }
 
-// ---- webhook ----
+// ---------- FB Webhook ----------
 export default async function handler(req, res) {
-  // Facebook Verify (GET)
   if (req.method === 'GET') {
-    const { ['hub.mode']:mode, ['hub.verify_token']:tok, ['hub.challenge']:chal } = req.query;
-    if (mode === 'subscribe' && tok === process.env.FB_VERIFY_TOKEN) return res.status(200).send(chal);
-    return res.status(403).send('Forbidden');
+    const mode = req.query['hub.mode'];
+    const token = req.query['hub.verify_token'];
+    const challenge = req.query['hub.challenge'];
+    if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+      return res.status(200).send(challenge);
+    }
+    return res.status(403).send('Verification failed');
   }
 
-  if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
+  if (req.method !== 'POST') {
+    return res.status(405).send('Method Not Allowed');
+  }
 
   try {
-    const sys = await qualifierPrompt();
-    const body = req.body || {};
-    if (body.object !== 'page') return res.status(404).send('Not a page');
+    const body = req.body;
+    if (body.object !== 'page') return res.status(200).send('ignored');
 
     for (const entry of body.entry || []) {
-      for (const ev of entry.messaging || []) {
-        const psid = ev?.sender?.id;
-        const text = ev?.message?.text || ev?.postback?.title || '';
-        if (!psid || !text) continue;
+      for (const event of entry.messaging || []) {
+        const psid = event.sender?.id;
+        if (!psid) continue;
 
-        const state = stateFor(psid);
-
-        // ===== Phase 3: selection & scheduling =====
-        if (state.stage === 'awaiting_selection') {
-          const n = parseInt(text.trim(), 10);
-          if (Number.isFinite(n) && n >= 1 && n <= (state.last?.length || 0)) {
-            const row = state.last[n - 1];
-            state.lastSelected = row;
-
-            const imgs = firstFiveImages(row);   // send image_1..image_5
-            if (imgs.length) await sendImages(psid, imgs);
-
-            await sendText(psid, `🚗 ${cardText(row, state.wants || {})}`);
-            await sendQuickReplies(psid, 'Gusto mo bang i-schedule ang viewing?', [
-              'Schedule viewing', 'More photos', 'Show other units'
-            ]);
-            state.stage = 'after_choice';
-            uiState.set(psid, state);
-            continue;
-          }
-          if (/see more|more|iba pa/i.test(text)) {
-            await sendText(psid, 'Pagination soon. Pili muna sa 1–3.');
-            continue;
-          }
-        } else if (state.stage === 'after_choice') {
-          if (/more (photo|photos|pics|pictures|images)/i.test(text)) {
-            const more = extraImages(state.lastSelected || {}); // image_6..image_10
-            if (more.length) await sendImages(psid, more);
-            else await sendText(psid, 'Wala nang additional photos for this unit. 😅');
-            await sendQuickReplies(psid, 'What next?', ['Schedule viewing', 'Show other units']);
-            continue;
-          }
-          if (/schedule/i.test(text)) {
-            await sendText(psid, 'Anong preferred date & time? (e.g., "Fri 3pm")');
-            state.stage = 'awaiting_when'; uiState.set(psid, state); continue;
-          }
-          if (/show other|iba/i.test(text)) {
-            await sendText(psid, 'Sige, pili ka ulit sa list or sabihin mo model.');
-            state.stage = 'awaiting_selection'; uiState.set(psid, state); continue;
-          }
-        } else if (state.stage === 'awaiting_when') {
-          state.schedule = { when: text.trim() };
-          await sendText(psid, 'Pakibigay ang mobile number (e.g., 0917xxxxxxx).');
-          state.stage = 'awaiting_phone'; uiState.set(psid, state); continue;
-        } else if (state.stage === 'awaiting_phone') {
-          state.schedule.phone = text.trim();
-          const u = state.lastSelected || state.last?.[0] || {};
-          await sendText(psid,
-            `✅ Tentative viewing set!\n` +
-            `Unit: ${u.year||''} ${u.brand||''} ${u.model||''} ${u.variant||''}\n` +
-            `When: ${state.schedule.when}\n` +
-            `Buyer: ${state.schedule.phone}\n` +
-            `Location: ${u.complete_address||u.city||'branch to confirm'}`
-          );
-          await sendText(psid, 'Our team will confirm the exact schedule. Anything else?');
-          state.stage = 'idle'; uiState.set(psid, state); continue;
-        }
-
-        // ===== YES after no-match: relaxed search =====
-        if (yes(text) && state.stage === 'idle' && state.noMatch) {
-          const inv = await fetchInventory();
-          const wants = relaxWants(extractWants(historyFor(psid, sys), inv));
-          const top = rankMatches(inv, wants).slice(0, 3);
-
-          if (top.length) {
-            await sendText(psid, 'Nag-relax ako ng criteria para may maipakita:');
-            for (const r of top) {
-              const imgs = firstFiveImages(r);
-              if (imgs.length) await sendImages(psid, imgs);
-              await sendText(psid, `🚗 ${cardText(r, wants)}`);
-            }
-            await sendQuickReplies(psid, 'Anong number ang pipiliin mo?', ['1','2','3','See more']);
-            Object.assign(state, { stage: 'awaiting_selection', last: top, wants, noMatch: false });
-            uiState.set(psid, state);
-          } else {
-            await sendText(psid, 'Wala pa rin. Pwede tayong maghanap ng ibang model or budget.');
-          }
-          // fallthrough to LLM
-        }
-
-        // ===== Phase 1: LLM conversation (qualifier) =====
-        const hist = historyFor(psid, sys);
-        hist.push({ role: 'user', content: text });
-        const reply = await chat(hist);
-        if (reply) {
-          hist.push({ role: 'assistant', content: reply });
-          sessions.set(psid, clamp(hist));
-          await sendText(psid, reply);
-        }
-
-        // ===== Phase 2 trigger: strict matching =====
-        if (reply && reply.includes(STOP_LINE)) {
-          try {
-            const inv = await fetchInventory();
-            const wants = extractWants(hist, inv);
-            const top = rankMatches(inv, wants).slice(0, 3);
-
-            if (top.length) {
-              await sendText(psid, 'Ito yung best na swak sa details mo:');
-              for (const r of top) {
-                const imgs = firstFiveImages(r);
-                if (imgs.length) await sendImages(psid, imgs);
-                await sendText(psid, `🚗 ${cardText(r, wants)}`);
-              }
-              await sendQuickReplies(psid, 'Anong number ang pipiliin mo?', ['1','2','3','See more']);
-              Object.assign(state, { stage: 'awaiting_selection', last: top, wants, noMatch: false });
-              uiState.set(psid, state);
-            } else {
-              await sendText(psid, 'Walang exact match. Okay i-expand nang konti ang budget or nearby cities?');
-              state.noMatch = true; uiState.set(psid, state);
-            }
-          } catch (e) {
-            console.error('matching error', e);
-            await sendText(psid, 'Nagkaproblema sa paghanap ng units. Subukan natin ulit mamaya.');
-          }
+        if (event.message?.text) {
+          await onMessage(psid, event.message.text.trim());
+        } else if (event.postback?.payload) {
+          await onMessage(psid, event.postback.payload.trim());
         }
       }
     }
-
-    res.status(200).send('OK');
+    return res.status(200).send('ok');
   } catch (e) {
     console.error('webhook error', e);
-    res.status(500).send('Server error');
+    return res.status(500).send('webhook error');
   }
 }
 
-// Ensure JSON body parsing on Vercel Node functions
-export const config = { api: { bodyParser: true } };
+// ---------- Message flow ----------
+async function onMessage(psid, text) {
+  const state = SESS.get(psid) || { want: {}, candidates: [], pickedIndex: null };
+  const lower = text.toLowerCase();
+
+  // 1) Selection of preview: "1", "2", "number 2", "#2", etc.
+  const pick = extractPickNumber(text);
+  if (pick && state.candidates?.length) {
+    const idx = pick - 1;
+    if (idx >= 0 && idx < state.candidates.length) {
+      const chosen = state.candidates[idx];
+      // Send full gallery
+      await sendText(psid, `Nice choice! 🔥 Sending full photos for:\n${prettyTitle(chosen)}`);
+      if (chosen.images?.length) {
+        await sendImagesSequential(psid, chosen.images);
+      } else if (chosen.image_1) {
+        await sendImage(psid, chosen.image_1);
+      }
+      await sendButtons(psid, "Gusto mo bang i-schedule ang viewing?", [
+        { type: "postback", title: "Schedule viewing", payload: "SCHEDULE_VIEWING" },
+        { type: "postback", title: "Show other units", payload: "SHOW_OTHERS" }
+      ]);
+      state.pickedIndex = idx;
+      SESS.set(psid, state);
+      return;
+    }
+  }
+
+  // Postback buttons
+  if (lower === 'schedule viewing' || lower === 'schedule_viewing' || lower === 'schedule viewing'.toLowerCase() || text === 'SCHEDULE_VIEWING') {
+    await sendText(psid, "Got it! I-che-check ko ang available schedule today/tomorrow. Kindly send your full name and preferred day/time.");
+    return;
+  }
+  if (lower === 'show other units' || text === 'SHOW_OTHERS') {
+    await showOtherUnits(psid, state);
+    return;
+  }
+
+  // 2) Update 'want' info from message (very light extraction)
+  //    (We keep it compact—your qualifying already works; these are helpers.)
+  updateWant(state.want, text);
+
+  // 3) If we already have enough info OR user mentions a model explicitly → search
+  const ready = isSearchReady(state.want) || looksLikeModel(text);
+  if (ready) {
+    const rows = await fetchInventory(state.want);
+    const picks = pickTopTwo(rows, state.want);
+    if (!picks.length) {
+      await sendText(psid, "Walang exact match. Okay ba i-expand ng kaunti ang budget or nearby city para may maipakita ako?");
+      SESS.set(psid, state);
+      return;
+    }
+
+    // Save in session
+    state.candidates = picks;
+    SESS.set(psid, state);
+
+    // 4) Send PREVIEW for two units (image_1 only)
+    await sendText(psid, "Ito yung best na swak sa details mo:");
+    for (let i = 0; i < picks.length; i++) {
+      const p = picks[i];
+      if (p.images?.length) await sendImage(psid, p.images[0]); // image_1
+      const blurb = `${i + 1}️⃣ ${prettyTitle(p)}\nAll-in: ${peso(p.all_in) || '—'}\n${(p.city || '')} — ${p.mileage ? `${p.mileage} km` : ''}`;
+      await sendText(psid, blurb);
+    }
+    await sendText(psid, "Anong number ang pipiliin mo?");
+    return;
+  }
+
+  // 5) If not ready yet, keep qualifying lightly
+  await sendText(psid, "Copy! Para tumama ang options, ano ang mas prefer mo — Cash or Financing?");
+}
+
+function prettyTitle(p) {
+  return `${p.year || ''} ${p.brand || ''} ${p.model || ''} ${p.variant || ''}`.replace(/\s+/g,' ').trim();
+}
+function peso(n) {
+  if (!Number.isFinite(n)) return null;
+  return "₱" + n.toLocaleString('en-PH', { maximumFractionDigits: 0 });
+}
+
+// ---------- Helpers ----------
+function looksLikeModel(text) {
+  // simple cue: mentions common car words or looks like a model ask
+  return /\b(mirage|vios|innova|fortuner|hiace|nv350|raize|brv|city|civic|accent|wigo|territory|stargazer|traviz|l300)\b/i.test(text);
+}
+function isSearchReady(want) {
+  // any model or brand + a budget clue is typically enough
+  if (want.model) return true;
+  if (want.brand && (want.cash_budget || want.cash_out)) return true;
+  return false;
+}
+
+function updateWant(want, text) {
+  const t = text.toLowerCase();
+
+  // payment
+  if (/\bcash\b/i.test(text)) want.payment = "cash";
+  if (/\bfinanc(e|ing|ing)\b|\bloan\b/i.test(text)) want.payment = "financing";
+
+  // transmission
+  if (/\bautomatic|at\b/i.test(text)) want.transmission = "automatic";
+  if (/\bmanual|mt\b/i.test(text)) want.transmission = "manual";
+
+  // body types
+  if (/\bsedan\b/i.test(text)) want.body_type = "sedan";
+  if (/\bsuv\b/i.test(text)) want.body_type = "suv";
+  if (/\bhatch|hatchback\b/i.test(text)) want.body_type = "hatchback";
+  if (/\bvan|nv350|hiace\b/i.test(text)) want.body_type = "van";
+
+  // model & brand (simple picks)
+  const models = ['mirage','vios','innova','fortuner','hiace','nv350','raize','brv','city','civic','accent','wigo','territory','stargazer','traviz','l300'];
+  for (const m of models) if (t.includes(m)) want.model = m;
+
+  const brands = ['toyota','mitsubishi','honda','nissan','hyundai','ford','isuzu','mg','geely','chery','suzuki','kia'];
+  for (const b of brands) if (t.includes(b)) want.brand = b;
+
+  // budget logic
+  const money = text.match(/(?:₱|\bphp\b|)\s*\d[\d,]{4,}/i);
+  if (money) {
+    const val = Number(money[0].replace(/[^\d]/g,''));
+    if (want.payment === "cash") want.cash_budget = val;
+    else want.cash_out = val; // financing default
+  }
+
+  // location rough
+  const mCity = text.match(/\b(?:qc|quezon|makati|pasig|manila|taguig|pasay|caloocan|valenzuela|mandaluyong|marikina|muntinlupa|parañaque)\b/i);
+  if (mCity) want.city = mCity[0];
+}
+
+// Fetch inventory rows from your Apps Script JSON
+async function fetchInventory(want) {
+  const url = new URL(INVENTORY_API);
+  // Soft filters (server returns all; we score client-side)
+  if (want.model) url.searchParams.set('model', want.model);
+  if (want.body_type) url.searchParams.set('body_type', want.body_type);
+  if (want.transmission) url.searchParams.set('transmission', want.transmission);
+  if (want.payment === 'cash' && want.cash_budget) url.searchParams.set('cash_budget', String(want.cash_budget));
+  if (want.payment === 'financing' && want.cash_out) url.searchParams.set('cash_out', String(want.cash_out));
+
+  const res = await fetch(url.toString(), { timeout: 15000 }).catch(() => null);
+  if (!res || !res.ok) return [];
+  const j = await res.json().catch(() => ({}));
+  return Array.isArray(j.items) ? j.items : [];
+}
+
+async function showOtherUnits(psid, state) {
+  // fallback: tell them you’ll search again (you can expand logic later)
+  await sendText(psid, "Sige, maghahanap pa ako ng ibang options na pasok sa specs mo.");
+  // You can fetch again with relaxed rules if you want.
+}
