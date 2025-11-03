@@ -1,39 +1,27 @@
 import fetch from 'node-fetch';
+import { readFile } from 'node:fs/promises';
+import path from 'node:path';
+
+// ---- Load prompt file & env-configurable defaults ----
+const QUALIFIER_PROMPT = await readFile(
+  path.join(process.cwd(), 'prompts', 'qualifier.txt'),
+  'utf8'
+);
+
+// Use one default model/temp for everything (you set these in Vercel)
+const MODEL = process.env.MODEL_DEFAULT || 'gpt-4.1';
+const TEMPERATURE = Number(process.env.TEMP_DEFAULT ?? 0.30);
 
 const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
-const MODEL = 'gpt-4o-mini';
-const MAX_TURNS = 18; // ~18 turns memory per user
+const MAX_TURNS = 18; // memory depth per user
 
-// Simple in-memory sessions (OK for initial test)
+// Simple in-memory sessions for Phase 1 tests (swap to Redis/DB later for persistence)
 const sessions = new Map();
 
 function historyFor(senderId) {
   if (!sessions.has(senderId)) {
     sessions.set(senderId, [
-      {
-        role: 'system',
-        content: `
-You are BentaCars’ AI Sales Consultant. Speak in friendly Taglish like a real human.
-
-Your job is to QUALIFY the buyer before showing any units.
-
-Ask only ONE question at a time.
-
-REQUIRED INFO TO COLLECT (any order):
-1) Cash or Financing
-2) Budget (cash price or monthly)
-3) Location (city/province)
-4) Preferred car type/model (if any)
-
-RULES:
-- Use the chat history. Do NOT repeat a question if already answered.
-- If the user answers off-topic, gently steer back to what’s missing.
-- Keep responses short, conversational, and helpful.
-- When ALL 4 are known, reply exactly once with:
-"GOT IT! ✅ I now have everything I need. I can now search available units for you."
-Then stop asking new questions.
-        `.trim()
-      }
+      { role: 'system', content: QUALIFIER_PROMPT }
     ]);
   }
   return sessions.get(senderId);
@@ -41,7 +29,7 @@ Then stop asking new questions.
 
 function clampHistory(arr) {
   const systemMsg = arr[0];
-  const tail = arr.slice(-MAX_TURNS * 2);
+  const tail = arr.slice(-MAX_TURNS * 2); // keep recent user/assistant pairs
   return [systemMsg, ...tail];
 }
 
@@ -55,7 +43,7 @@ async function sendToOpenAI(history) {
     body: JSON.stringify({
       model: MODEL,
       messages: history,
-      temperature: 0.3
+      temperature: TEMPERATURE
     })
   });
   const json = await resp.json();
@@ -85,7 +73,7 @@ async function sendToMessenger(psid, text) {
 }
 
 export default async function handler(req, res) {
-  // --- Verify webhook (GET) ---
+  // --- Webhook verification (GET) ---
   if (req.method === 'GET') {
     const mode = req.query['hub.mode'];
     const token = req.query['hub.verify_token'];
@@ -96,7 +84,7 @@ export default async function handler(req, res) {
     return res.status(403).send('Forbidden');
   }
 
-  // --- Handle messages (POST) ---
+  // --- Incoming messages (POST) ---
   if (req.method === 'POST') {
     try {
       const body = req.body;
@@ -107,6 +95,7 @@ export default async function handler(req, res) {
           const psid = event?.sender?.id;
           if (!psid) continue;
 
+          // Support text and simple postback titles
           const text =
             event?.message?.text ||
             event?.postback?.title ||
@@ -114,15 +103,19 @@ export default async function handler(req, res) {
 
           if (!text) continue;
 
+          // Update conversation memory
           const hist = historyFor(psid);
           hist.push({ role: 'user', content: text });
 
+          // Ask OpenAI
           const reply = await sendToOpenAI(hist);
           if (!reply) continue;
 
+          // Save AI reply then clamp memory
           hist.push({ role: 'assistant', content: reply });
           sessions.set(psid, clampHistory(hist));
 
+          // Send to Messenger
           await sendToMessenger(psid, reply);
         }
       }
@@ -136,5 +129,5 @@ export default async function handler(req, res) {
   return res.status(405).send('Method Not Allowed');
 }
 
-// Ensure JSON body parsing is enabled on Vercel Node functions
+// Ensure JSON body parsing is enabled for Vercel Node functions
 export const config = { api: { bodyParser: true } };
