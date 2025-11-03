@@ -2,11 +2,10 @@
 // Conversational Messenger webhook (no buttons) with human-style qualifying + 2-offer flow
 
 import { sendText, sendTypingOn, sendTypingOff, sendImage } from './lib/messenger.js';
-import { pickModel, pickTemp } from './lib/llm.js';
 
 const FB_PAGE_TOKEN = process.env.FB_PAGE_TOKEN;
 const FB_VERIFY_TOKEN = process.env.FB_VERIFY_TOKEN;
-const INVENTORY_API_URL = process.env.INVENTORY_API_URL; // e.g. your Apps Script endpoint
+const INVENTORY_API_URL = process.env.INVENTORY_API_URL; // Apps Script endpoint
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const MODEL_DEFAULT = process.env.MODEL_DEFAULT || 'gpt-4.1';
 const TEMP_DEFAULT = Number(process.env.TEMP_DEFAULT ?? 0.30);
@@ -19,16 +18,8 @@ function getState(senderId) {
     sessions.set(senderId, {
       createdAt: Date.now(),
       phase: 'qualify',           // qualify → offer → await_selection → followup
-      info: {
-        // payment: 'cash' | 'financing'
-        // location: 'quezon city'
-        // body: 'sedan' | 'suv' | 'mpv' | 'van' | 'pickup' | 'any'
-        // trans: 'AT' | 'MT' | 'any'
-        // budgetCash: {min,max}   (cash)
-        // budgetAllIn: {min,max}  (financing)
-        // model: 'vios' / 'mirage' (optional)
-      },
-      offered: [],               // keep last offered items for selection
+      info: {},
+      offered: [],
       lastOfferHash: '',
       greetDone: false,
       lastMsgTime: 0,
@@ -44,10 +35,7 @@ function resetState(senderId) {
 
 // ---------- tiny NLP helpers ----------
 const norm = s => (s || '').toString().trim().toLowerCase();
-
-function hasWord(s, w) {
-  return new RegExp(`\\b${w}\\b`, 'i').test(s || '');
-}
+function hasWord(s, w) { return new RegExp(`\\b${w}\\b`, 'i').test(s || ''); }
 
 function detectPayment(text) {
   const t = norm(text);
@@ -55,7 +43,6 @@ function detectPayment(text) {
   if (/financ(e|ing)|installment|hulugan|loan/i.test(t)) return 'financing';
   return null;
 }
-
 function detectBody(text) {
   const t = norm(text);
   if (/\bsedan\b/i.test(t)) return 'sedan';
@@ -66,7 +53,6 @@ function detectBody(text) {
   if (/\b(any|kahit ano)\b/i.test(t)) return 'any';
   return null;
 }
-
 function detectTransmission(text) {
   const t = norm(text);
   if (/\b(a\/?t|automatic|matic)\b/i.test(t)) return 'AT';
@@ -74,42 +60,28 @@ function detectTransmission(text) {
   if (/\b(any)\b/i.test(t)) return 'any';
   return null;
 }
-
 function extractBudgetRange(text) {
-  // accepts "450k-600k", "below 600k", "up to 500k", "around 550k", "500000"
   const t = norm(text).replace(/[,₱\s]/g, '');
   const m = t.match(/(\d{3,7})(?:-|\sto\s|~|–|—)(\d{3,7})/);
   if (m) {
-    const a = Number(m[1]);
-    const b = Number(m[2]);
-    const min = Math.min(a,b);
-    const max = Math.max(a,b);
+    const a = Number(m[1]); const b = Number(m[2]);
+    const min = Math.min(a,b); const max = Math.max(a,b);
     if (min && max) return { min, max };
   }
   const below = t.match(/(?:below|under|upto|up?to|max|hanggang)(\d{3,7})/);
   if (below) return { min: 0, max: Number(below[1]) };
   const single = t.match(/(\d{5,7})/);
-  if (single) {
-    const x = Number(single[1]);
-    // ±50k band
-    return { min: Math.max(0, x - 50000), max: x + 50000 };
-  }
+  if (single) { const x = Number(single[1]); return { min: Math.max(0, x-50000), max: x+50000 }; }
   const withK = norm(text).match(/(\d{2,3})\s*k/);
-  if (withK) {
-    const x = Number(withK[1]) * 1000;
-    return { min: Math.max(0, x - 50000), max: x + 50000 };
-  }
+  if (withK) { const x = Number(withK[1]) * 1000; return { min: Math.max(0, x-50000), max: x+50000 }; }
   return null;
 }
-
 function detectModel(text) {
-  // light model sniff (examples common to your inventory)
   const t = norm(text);
   const list = ['vios','mirage','hiace','nv350','urvan','livina','terra','fortuner','innova','city','civic'];
   for (const m of list) if (hasWord(t, m)) return m;
   return null;
 }
-
 function isRestart(text) {
   const t = norm(text);
   return ['restart','ulit tayo','start over','bagong search','new inquiry'].some(k => hasWord(t,k));
@@ -118,8 +90,6 @@ function isRestart(text) {
 // ---- Inventory fetch + selection ----
 async function queryInventory(params) {
   const url = new URL(INVENTORY_API_URL);
-  // These query keys are aligned with your Apps Script: feel free to adjust there or here.
-  // We'll pass a flexible payload the script tolerates (it ignores unknowns).
   if (params.body) url.searchParams.set('body', params.body);
   if (params.trans) url.searchParams.set('trans', params.trans);
   if (params.city) url.searchParams.set('city', params.city);
@@ -135,39 +105,34 @@ async function queryInventory(params) {
   if (!res.ok) throw new Error(`Inventory HTTP ${res.status}`);
   return await res.json(); // expects {ok, count, items: [...]}
 }
-
 function prioritize(items) {
   const pri = items.filter(x => (x.price_status || '').toLowerCase() === 'priority');
   const rest = items.filter(x => (x.price_status || '').toLowerCase() !== 'priority');
   return [...pri, ...rest];
 }
-
-function pickTopTwo(items) {
-  const arr = prioritize(items);
-  return arr.slice(0, 2);
-}
+function pickTopTwo(items) { return prioritize(items).slice(0, 2); }
 
 function shortCaption(item, index) {
   const n = index + 1;
   const yr = item.year ? `${item.year} ` : '';
   const name = [yr, item.brand, item.model, item.variant || ''].filter(Boolean).join(' ').replace(/\s+/g,' ').trim();
   const allin = item.all_in || item.price_all_in || item['all-in'] || item.allin;
-  const km = item.mileage ? `${item.mileage.toLocaleString()} km` : '';
+  const km = item.mileage ? `${Number(item.mileage).toLocaleString()} km` : '';
   const city = item.city || (item.complete_address || '').split(',')[0];
   const priceLine = allin ? `All-in: ₱${Number(allin).toLocaleString()}` : (item.srp ? `Cash: ₱${Number(item.srp).toLocaleString()}` : '');
   const locLine = [city, km].filter(Boolean).join(' — ');
   return `#${n} ${name}\n${priceLine}\n${locLine}`;
 }
 
-// ---- LLM helper (for tone + micro rephrasings, optional) ----
+// ---- LLM rewriter (optional; uses env model/temp directly) ----
 async function llmRewrite(system, user) {
   try {
     const res = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: pickModel(MODEL_DEFAULT),
-        temperature: pickTemp(TEMP_DEFAULT, 0.3),
+        model: MODEL_DEFAULT,
+        temperature: TEMP_DEFAULT,
         messages: [
           { role: 'system', content: system },
           { role: 'user', content: user }
@@ -177,7 +142,7 @@ async function llmRewrite(system, user) {
     const data = await res.json();
     return (data.choices?.[0]?.message?.content || '').trim();
   } catch {
-    return user; // fallback to raw text
+    return user; // fallback
   }
 }
 
@@ -192,31 +157,11 @@ Before ko i-match, a few quick questions para mahanap ko agad ang best deal (no 
     await sendText(senderId, msg);
   }
 
-  // 1) Payment
-  if (!info.payment) {
-    await sendText(senderId, `Una: **Cash** ba o **Financing** ang plan mo? 🙂`);
-    return;
-  }
+  if (!info.payment) { await sendText(senderId, `Una: **Cash** ba o **Financing** ang plan mo? 🙂`); return; }
+  if (!info.location) { await sendText(senderId, `Saan location ninyo? (city/province)`); return; }
+  if (!info.body)     { await sendText(senderId, `May preferred **body type** ka ba? (sedan/suv/mpv/van/pickup — o ‘any’)`); return; }
+  if (!info.trans)    { await sendText(senderId, `Transmission? (automatic / manual — pwede ring ‘any’)`); return; }
 
-  // 2) Location
-  if (!info.location) {
-    await sendText(senderId, `Saan location ninyo? (city/province)`);
-    return;
-  }
-
-  // 3) Body type
-  if (!info.body) {
-    await sendText(senderId, `May preferred **body type** ka ba? (e.g., sedan, suv, mpv, van, pickup — o ‘any’)`);
-    return;
-  }
-
-  // 4) Transmission
-  if (!info.trans) {
-    await sendText(senderId, `Transmission? (automatic / manual — pwede ring ‘any’)`);
-    return;
-  }
-
-  // 5) Budget last
   if (info.payment === 'cash' && !info.budgetCash) {
     await sendText(senderId, `Magkano ang **cash budget range** mo? (e.g., 450k-600k o ‘below 600k’)`);
     return;
@@ -226,7 +171,6 @@ Before ko i-match, a few quick questions para mahanap ko agad ang best deal (no 
     return;
   }
 
-  // Ready to search
   state.phase = 'offer';
   await sendText(senderId, `GOT IT! ✅ I’ll search the best matches now based on details mo.`);
   await doOffer(senderId, state);
@@ -243,12 +187,10 @@ async function doOffer(senderId, state) {
     model: info.model || '',
   };
   if (info.payment === 'cash' && info.budgetCash) {
-    params.cashMin = info.budgetCash.min;
-    params.cashMax = info.budgetCash.max;
+    params.cashMin = info.budgetCash.min; params.cashMax = info.budgetCash.max;
   }
   if (info.payment === 'financing' && info.budgetAllIn) {
-    params.allInMin = info.budgetAllIn.min;
-    params.allInMax = info.budgetAllIn.max;
+    params.allInMin = info.budgetAllIn.min; params.allInMax = info.budgetAllIn.max;
   }
 
   await sendTypingOn(senderId);
@@ -264,21 +206,19 @@ async function doOffer(senderId, state) {
 
   const items = Array.isArray(data?.items) ? data.items : [];
   if (!items.length) {
-    await sendText(senderId, `Wala pang exact match. Okay bang **i-expand** ng kaunti ang budget o nearby cities para may maipakita ako?`);
+    await sendText(senderId, `Walang exact match. Okay bang **i-expand** natin ng konti ang budget o nearby cities para may maipakita ako?`);
     state.phase = 'qualify';
     return;
   }
 
   const top = pickTopTwo(items);
   if (!top.length) {
-    await sendText(senderId, `Wala pang exact match. G gusto mo bang magbukas tayo ng ibang options (ibang model/body type)?`);
+    await sendText(senderId, `Wala pang exact match. Gusto mo bang magbukas tayo ng ibang options (ibang model/body type)?`);
     state.phase = 'qualify';
     return;
   }
 
   await sendText(senderId, `Ito yung best na swak sa details mo (priority muna if available):`);
-
-  // send each with image_1 + caption
   for (let i = 0; i < top.length; i++) {
     const car = top[i];
     const img = car.image_1 || car.image1 || '';
@@ -299,27 +239,20 @@ async function sendFullPhotos(senderId, item) {
     if (v && typeof v === 'string' && v.startsWith('http')) urls.push(v);
   }
   if (!urls.length && item.image1) {
-    // fallback naming
     for (let i = 1; i <= 10; i++) {
       const key = `image${i}`;
       if (item[key]) urls.push(item[key]);
     }
   }
-  if (!urls.length) {
-    await sendText(senderId, `Wala pang additional photos sa record ko for this unit—pwede ko i-request sa dealer ngayon. ✅`);
-    return;
-  }
+  if (!urls.length) { await sendText(senderId, `Wala pang additional photos saved—pwede ko i-request sa dealer ngayon. ✅`); return; }
   await sendText(senderId, `Here are the full photos for your selected unit:`);
-  for (const u of urls) {
-    await sendImage(senderId, u);
-  }
+  for (const u of urls) await sendImage(senderId, u);
   await sendText(senderId, `Gusto mo ba i-schedule ang viewing? Sabihin mo lang “schedule viewing” kung ready ka.`);
 }
 
 // -------------- Messenger plumbing --------------
 export default async function handler(req, res) {
   try {
-    // Vercel recently requires raw body parsing; guard both
     const method = req.method;
     if (method === 'GET') {
       const mode = req.query['hub.mode'];
@@ -334,8 +267,6 @@ export default async function handler(req, res) {
     if (method === 'POST') {
       const body = typeof req.body === 'object' ? req.body
                   : (typeof req.json === 'function' ? await req.json() : {});
-
-      // Basic guard
       if (!body || body.object !== 'page') return res.status(200).send('ok');
 
       for (const entry of body.entry || []) {
@@ -343,10 +274,8 @@ export default async function handler(req, res) {
           const senderId = event.sender?.id;
           if (!senderId) continue;
 
-          // typing indicator light touch
           await sendTypingOn(senderId);
 
-          // restart logic
           const text = event.message?.text || event.postback?.title || '';
           if (text && isRestart(text)) {
             resetState(senderId);
@@ -360,14 +289,12 @@ export default async function handler(req, res) {
           const state = getState(senderId);
           state.lastMsgTime = Date.now();
 
-          // Returning user friendly hello (no buttons)
           if (!state.greetDone) {
             if (state.createdAt && Date.now() - state.createdAt > 60_000) {
               await sendText(senderId, `Welcome back! ✅ We can continue from last details, or say “restart” to start over.`);
             }
           }
 
-          // If currently awaiting selection and user chose 1 or 2
           const choiceMatch = (event.message?.text || '').trim().match(/^\s*[#\[]?\s*(\d{1,2})\s*[\]\.]?\s*$/);
           if (state.phase === 'await_selection' && choiceMatch) {
             const idx = Number(choiceMatch[1]) - 1;
@@ -380,59 +307,34 @@ export default async function handler(req, res) {
             }
           }
 
-          // Parse any info from free text (natural chat)
           const msg = event.message?.text || '';
           if (msg) {
-            // detect & fill missing fields
-            if (!state.info.payment) {
-              const p = detectPayment(msg);
-              if (p) state.info.payment = p;
-            }
-            if (!state.info.body) {
-              const b = detectBody(msg);
-              if (b) state.info.body = b;
-            }
-            if (!state.info.trans) {
-              const tr = detectTransmission(msg);
-              if (tr) state.info.trans = tr;
-            }
-            if (!state.info.model) {
-              const mm = detectModel(msg);
-              if (mm) state.info.model = mm;
-            }
+            if (!state.info.payment) { const p = detectPayment(msg); if (p) state.info.payment = p; }
+            if (!state.info.body)     { const b = detectBody(msg);   if (b) state.info.body   = b; }
+            if (!state.info.trans)    { const tr = detectTransmission(msg); if (tr) state.info.trans = tr; }
+            if (!state.info.model)    { const mm = detectModel(msg); if (mm) state.info.model = mm; }
 
-            // location heuristic: if looks like a place and not a command
             if (!state.info.location) {
-              // simple guess: if the message contains 'city' or is short (~2 words), treat as location
               if (/\bcity|province|qc|quezon|manila|makati|pasig|mandaluyong|taguig|cainta|cavite|laguna|bulacan|antipolo|paranaque|las pinas|valenzuela|caloocan|malabon|navotas/i.test(msg)) {
                 state.info.location = msg.trim();
               }
             }
 
-            // budget at the end depending on mode
             if (state.info.payment === 'cash' && !state.info.budgetCash) {
-              const r = extractBudgetRange(msg);
-              if (r) state.info.budgetCash = r;
+              const r = extractBudgetRange(msg); if (r) state.info.budgetCash = r;
             } else if (state.info.payment === 'financing' && !state.info.budgetAllIn) {
-              const r = extractBudgetRange(msg);
-              if (r) state.info.budgetAllIn = r;
+              const r = extractBudgetRange(msg); if (r) state.info.budgetAllIn = r;
             }
           }
 
-          // Flow control
           if (state.phase === 'offer' || state.phase === 'await_selection' || state.phase === 'followup') {
-            // If user typed a normal sentence while we wait selection, allow “show other” or “ibang options”
             if (/ibang|other|more|iba pang|show more|ibang unit/i.test(msg)) {
-              state.phase = 'offer';
-              // clear last offered to fetch new
-              state.offered = [];
+              state.phase = 'offer'; state.offered = [];
               await doOffer(senderId, state);
             } else if (state.phase !== 'await_selection') {
-              // continue qualifying or re-offer
               await askNextQuestion(senderId, state);
             }
           } else {
-            // still qualifying
             await askNextQuestion(senderId, state);
           }
 
@@ -445,7 +347,6 @@ export default async function handler(req, res) {
     return res.status(405).send('Method Not Allowed');
   } catch (err) {
     console.error('webhook error', err);
-    // Be resilient: don’t break the FB webhook handshake
     try { return res.status(200).send('ok'); } catch {}
   }
 }
