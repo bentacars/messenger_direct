@@ -1,97 +1,71 @@
 // api/lib/messenger.js
-// Messenger helpers: text, quick replies, single image, and gallery carousel
-const PAGE_TOKEN = process.env.FB_PAGE_TOKEN;
+const FB_TOKEN = process.env.FB_PAGE_TOKEN;
+const FB_API = 'https://graph.facebook.com/v18.0/me/messages';
 
-async function fbCall(body) {
-  const url = `https://graph.facebook.com/v19.0/me/messages?access_token=${PAGE_TOKEN}`;
-  const res = await fetch(url, {
+async function fbSend(payload) {
+  const resp = await fetch(`${FB_API}?access_token=${encodeURIComponent(FB_TOKEN)}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    body: JSON.stringify(payload),
   });
-  if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    console.error('FB send error', res.status, t);
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '');
+    console.error('FB send error', resp.status, text);
+    return false;
   }
+  return true;
 }
 
-// ----------- send primitives -----------
-export async function sendText(senderId, text) {
-  return fbCall({ recipient: { id: senderId }, message: { text } });
+export async function sendTypingOn(id)  { return fbSend({ recipient:{ id }, sender_action:'typing_on'  }); }
+export async function sendTypingOff(id) { return fbSend({ recipient:{ id }, sender_action:'typing_off' }); }
+
+export async function sendText(id, text) {
+  return fbSend({ recipient:{ id }, message:{ text } });
 }
 
-export async function sendQuickReplies(senderId, text, options = []) {
-  const quick_replies = options.map(o => ({
-    content_type: 'text',
-    title: o.title,
-    payload: o.payload,
-  }));
-  return fbCall({
-    recipient: { id: senderId },
-    message: { text, quick_replies },
-  });
-}
-
-export async function sendImage(senderId, imageUrl) {
-  return fbCall({
-    recipient: { id: senderId },
-    message: {
-      attachment: {
+export async function sendImage(id, url) {
+  return fbSend({
+    recipient:{ id },
+    message:{
+      attachment:{
         type: 'image',
-        payload: { url: imageUrl, is_reusable: false },
-      },
-    },
+        payload: { url, is_reusable: false }
+      }
+    }
   });
 }
 
-// ----------- gallery (carousel) -----------
-export async function sendGallery(senderId, elements) {
-  // elements = [{title, image_url, subtitle?, default_url?, buttons?}]
+export async function sendQuickReplies(id, text, replies) {
+  const qr = (replies || []).map(r => ({
+    content_type: 'text',
+    title: (r.title || '').slice(0, 20),
+    payload: r.payload || r.title || 'CHOOSE',
+  }));
+  return fbSend({ recipient:{ id }, message:{ text, quick_replies: qr } });
+}
+
+/**
+ * Send a Generic Template (carousel/gallery).
+ * Returns true if Facebook accepts, false if it rejects (so caller can fallback).
+ */
+export async function sendGenericTemplate(id, elements) {
+  if (!elements || !elements.length) return false;
   const payload = {
-    template_type: 'generic',
-    image_aspect_ratio: 'square', // looks best for car photos; can be "horizontal"
-    sharable: true,
-    elements: elements.slice(0, 10), // Messenger limit per message
+    recipient:{ id },
+    message:{
+      attachment:{
+        type: 'template',
+        payload:{
+          template_type: 'generic',
+          elements: elements.slice(0, 10).map(el => ({
+            title: (el.title || 'Vehicle').slice(0, 80),
+            subtitle: (el.subtitle || '').slice(0, 80),
+            image_url: el.image_url || undefined,
+            buttons: (el.buttons || []).slice(0, 3),
+          })),
+        }
+      }
+    }
   };
-
-  // map to Messenger element shape
-  payload.elements = payload.elements.map(el => ({
-    title: el.title?.slice(0, 80) || 'Photo',
-    image_url: el.image_url,
-    subtitle: el.subtitle?.slice(0, 80) || '',
-    default_action: el.default_url
-      ? { type: 'web_url', url: el.default_url }
-      : undefined,
-    buttons: el.buttons?.slice(0, 3),
-  }));
-
-  return fbCall({
-    recipient: { id: senderId },
-    message: { attachment: { type: 'template', payload } },
-  });
-}
-
-// Helper to build a plain photo gallery from a list of URLs
-export function buildImageElements(urls = []) {
-  let total = urls.length;
-  return urls.slice(0, 10).map((u, i) => ({
-    title: `Photo ${i + 1} / ${total}`,
-    image_url: u,
-    default_url: u,
-  }));
-}
-
-// ----------- restart / greetings detection -----------
-export function isRestart(text = '') {
-  const t = text.trim().toLowerCase();
-  return [
-    'restart','reset','start over','start','new','bagong chat','bagong usapan',
-    'ulit','ulit tayo','umpisa','fresh start'
-  ].some(k => t === k || t.startsWith(k));
-}
-
-export function isGreeting(text = '') {
-  const t = text.trim().toLowerCase();
-  return ['hi','hello','hey','kumusta','kamusta','good morning','good pm','good evening']
-    .some(k => t === k || t.startsWith(k));
+  return fbSend(payload);
 }
