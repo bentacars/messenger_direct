@@ -1,468 +1,451 @@
 // api/webhook.js
-import { sendText, sendTypingOn, sendTypingOff, sendImage, sendQuickReplies, sendGenericTemplate } from './lib/messenger.js';
-import { scoreAndSelect } from './lib/matching.js';
+// Conversational Messenger webhook (no buttons) with human-style qualifying + 2-offer flow
 
+import { sendText, sendTypingOn, sendTypingOff, sendImage } from './lib/messenger.js';
+import { pickModel, pickTemp } from './lib/llm.js';
+
+const FB_PAGE_TOKEN = process.env.FB_PAGE_TOKEN;
+const FB_VERIFY_TOKEN = process.env.FB_VERIFY_TOKEN;
+const INVENTORY_API_URL = process.env.INVENTORY_API_URL; // e.g. your Apps Script endpoint
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const MODEL_DEFAULT = process.env.MODEL_DEFAULT || 'gpt-4.1';
-const TEMP_DEFAULT  = Number(process.env.TEMP_DEFAULT || 0.30);
-const INVENTORY_API_URL = process.env.INVENTORY_API_URL;
+const TEMP_DEFAULT = Number(process.env.TEMP_DEFAULT ?? 0.30);
 
-const SESSIONS = new Map(); // in-memory (ok for your current dev)
+// ---- simple in-memory sessions (ok for first release; move to Redis later) ----
+const sessions = new Map();
 
-function initSession(id) {
-  if (!SESSIONS.has(id)) {
-    SESSIONS.set(id, {
-      phase: 'qualify',
-      collected: {
-        payment: null,         // 'cash' | 'financing'
-        location: null,        // 'quezon city'
-        body_type: null,       // 'sedan' | 'suv' | 'mpv' | 'van' | 'pickup' | 'any'
-        transmission: null,    // 'automatic' | 'manual' | 'any'
-        budget_cash: null,     // e.g. {min:450000,max:600000}
-        budget_allin: null,    // for financing (cash-out)
-        model: null,           // 'mirage' (optional)
-        brand: null,           // 'toyota' (optional)
-        year: null             // 2019 (optional)
+function getState(senderId) {
+  if (!sessions.has(senderId)) {
+    sessions.set(senderId, {
+      createdAt: Date.now(),
+      phase: 'qualify',           // qualify → offer → await_selection → followup
+      info: {
+        // payment: 'cash' | 'financing'
+        // location: 'quezon city'
+        // body: 'sedan' | 'suv' | 'mpv' | 'van' | 'pickup' | 'any'
+        // trans: 'AT' | 'MT' | 'any'
+        // budgetCash: {min,max}   (cash)
+        // budgetAllIn: {min,max}  (financing)
+        // model: 'vios' / 'mirage' (optional)
       },
-      lastOffers: [],          // array of car objects
-      selected: null,          // picked car
+      offered: [],               // keep last offered items for selection
+      lastOfferHash: '',
+      greetDone: false,
+      lastMsgTime: 0,
     });
   }
-  return SESSIONS.get(id);
+  return sessions.get(senderId);
 }
 
-function normalizeText(s='') {
-  return String(s).trim().toLowerCase();
+function resetState(senderId) {
+  sessions.delete(senderId);
+  return getState(senderId);
 }
 
-// lightweight NLP for auto-detect
-function detectHints(txt) {
-  const t = normalizeText(txt);
-  const hints = {};
-  if (/financ(ing|e)|loan|hulugan|all[- ]?in|cash[- ]?out/.test(t)) hints.payment = 'financing';
-  if (/\b(cash|spot cash|full cash|straight)\b/.test(t)) hints.payment = 'cash';
+// ---------- tiny NLP helpers ----------
+const norm = s => (s || '').toString().trim().toLowerCase();
 
-  if (/\bautomatic\b|auto\b/.test(t)) hints.transmission = 'automatic';
-  if (/\bmanual\b/.test(t)) hints.transmission = 'manual';
-
-  if (/\b(sedan|suv|van|mpv|pickup|pick[- ]?up)\b/.test(t)) {
-    const m = t.match(/\b(sedan|suv|van|mpv|pickup|pick[- ]?up)\b/);
-    hints.body_type = (m[1] === 'pick-up' || m[1] === 'pick up' || m[1] === 'pick-up') ? 'pickup' : m[1].replace('pick ', 'pick');
-  }
-
-  // budget phrases
-  if (/below\s*\d+k?|\d+\s*k\s*max/.test(t)) {
-    const n = Number(t.replace(/[^0-9]/g,''));
-    if (n) hints.budget_cash = {min: 0, max: n * 1000};
-  } else if (/(\d+)\s*k\s*to\s*(\d+)\s*k/.test(t)) {
-    const m = t.match(/(\d+)\s*k\s*to\s*(\d+)\s*k/);
-    hints.budget_cash = {min: Number(m[1])*1000, max: Number(m[2])*1000};
-  }
-
-  // model/brand tokens (very simple)
-  const brands = ['toyota','honda','mitsubishi','nissan','ford','suzuki','hyundai','kia','isuzu'];
-  const models = ['vios','mirage','wigo','city','civic','territory','stargazer','avanza','innova','fortuner','hiace','nv350','livina','raize','almera','accent','brv','br-v','montero','everest'];
-  for (const b of brands) if (new RegExp(`\\b${b}\\b`).test(t)) hints.brand = b;
-  for (const m of models) if (new RegExp(`\\b${m}\\b`).test(t)) hints.model = m.replace('-','');
-
-  const y = t.match(/\b(20\d{2}|19\d{2})\b/);
-  if (y) hints.year = Number(y[1]);
-
-  if (/any\s+(sedan|suv|van|mpv|pickup)/.test(t)) {
-    hints.body_type = t.match(/any\s+(sedan|suv|van|mpv|pickup)/)[1];
-  }
-  if (/\bany\b/.test(t)) {
-    hints.body_type ??= 'any';
-    hints.transmission ??= 'any';
-  }
-  return hints;
+function hasWord(s, w) {
+  return new RegExp(`\\b${w}\\b`, 'i').test(s || '');
 }
 
-// helpers
-function stillNeeds(col) {
-  const order = ['payment','location','body_type','transmission','budget'];
-  if (!col.payment) return 'payment';
-  if (!col.location) return 'location';
-  if (!col.body_type && !(col.model || col.brand)) return 'body_type';
-  if (!col.transmission && !(col.model)) return 'transmission';
-  if (col.payment === 'cash' && !col.budget_cash) return 'budget';
-  if (col.payment === 'financing' && !col.budget_allin) return 'budget';
+function detectPayment(text) {
+  const t = norm(text);
+  if (/(cash\s?basis|full cash|spot\s?cash|cash\b)/i.test(t)) return 'cash';
+  if (/financ(e|ing)|installment|hulugan|loan/i.test(t)) return 'financing';
   return null;
 }
 
-async function fetchInventory(params) {
-  // POST to your Apps Script endpoint
-  const q = {
-    ...params,
-    limit: 12,       // wider fetch, we’ll score client-side
-    include_images: true
-  };
-  const resp = await fetch(INVENTORY_API_URL, {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify(q)
-  });
-  if (!resp.ok) throw new Error(`Inventory API ${resp.status}`);
-  const data = await resp.json();
-  return Array.isArray(data.items) ? data.items : (Array.isArray(data) ? data : []);
+function detectBody(text) {
+  const t = norm(text);
+  if (/\bsedan\b/i.test(t)) return 'sedan';
+  if (/\bsuv\b/i.test(t)) return 'suv';
+  if (/\bmpv\b/i.test(t)) return 'mpv';
+  if (/\bvan\b/i.test(t)) return 'van';
+  if (/\bpick ?up\b/i.test(t)) return 'pickup';
+  if (/\b(any|kahit ano)\b/i.test(t)) return 'any';
+  return null;
 }
 
-function buildCaption(car) {
-  const year  = car.year || '';
-  const brand = car.brand || '';
-  const model = car.model || '';
-  const variant = car.variant ? ` ${car.variant}` : '';
-  const allin = car.price_all_in || car.all_in || car['all_in'] || car['price_all_in'] || null;
-  const km = car.mileage ? `${Number(car.mileage).toLocaleString()} km` : '';
-  const city = car.city || car.location || '';
-  const priceLine = allin ? `All-in: ₱${Number(allin).toLocaleString()}` : (car.srp ? `Cash: ₱${Number(car.srp).toLocaleString()}` : '');
-  return `🚗 ${year} ${brand} ${model}${variant}\n${priceLine}\n${city}${km ? ` — ${km}`:''}`;
+function detectTransmission(text) {
+  const t = norm(text);
+  if (/\b(a\/?t|automatic|matic)\b/i.test(t)) return 'AT';
+  if (/\b(m\/?t|manual)\b/i.test(t)) return 'MT';
+  if (/\b(any)\b/i.test(t)) return 'any';
+  return null;
 }
 
-function carImages(car) {
-  const imgs = [];
-  for (let i=1;i<=10;i++){
-    const key = `image_${i}`;
-    if (car[key] && typeof car[key] === 'string' && car[key].startsWith('http')) imgs.push(car[key]);
+function extractBudgetRange(text) {
+  // accepts "450k-600k", "below 600k", "up to 500k", "around 550k", "500000"
+  const t = norm(text).replace(/[,₱\s]/g, '');
+  const m = t.match(/(\d{3,7})(?:-|\sto\s|~|–|—)(\d{3,7})/);
+  if (m) {
+    const a = Number(m[1]);
+    const b = Number(m[2]);
+    const min = Math.min(a,b);
+    const max = Math.max(a,b);
+    if (min && max) return { min, max };
   }
-  return imgs;
+  const below = t.match(/(?:below|under|upto|up?to|max|hanggang)(\d{3,7})/);
+  if (below) return { min: 0, max: Number(below[1]) };
+  const single = t.match(/(\d{5,7})/);
+  if (single) {
+    const x = Number(single[1]);
+    // ±50k band
+    return { min: Math.max(0, x - 50000), max: x + 50000 };
+  }
+  const withK = norm(text).match(/(\d{2,3})\s*k/);
+  if (withK) {
+    const x = Number(withK[1]) * 1000;
+    return { min: Math.max(0, x - 50000), max: x + 50000 };
+  }
+  return null;
 }
 
-// -------- Messenger intents (buttons / commands)
-function isRestart(txt) { return /\b(restart|reset|start over|new search|ulit tayo)\b/i.test(txt); }
-function isMorePhotos(txt) { return /\b(photos|full photos|more photos|view full photos|pictures)\b/i.test(txt); }
-function isShowOthers(txt) { return /\b(show other|ibang unit|other options|more options)\b/i.test(txt); }
-function isSchedule(txt)   { return /\b(schedule|viewing|test drive|testdrive)\b/i.test(txt); }
+function detectModel(text) {
+  // light model sniff (examples common to your inventory)
+  const t = norm(text);
+  const list = ['vios','mirage','hiace','nv350','urvan','livina','terra','fortuner','innova','city','civic'];
+  for (const m of list) if (hasWord(t, m)) return m;
+  return null;
+}
 
-// ===== Main handler =====
+function isRestart(text) {
+  const t = norm(text);
+  return ['restart','ulit tayo','start over','bagong search','new inquiry'].some(k => hasWord(t,k));
+}
+
+// ---- Inventory fetch + selection ----
+async function queryInventory(params) {
+  const url = new URL(INVENTORY_API_URL);
+  // These query keys are aligned with your Apps Script: feel free to adjust there or here.
+  // We'll pass a flexible payload the script tolerates (it ignores unknowns).
+  if (params.body) url.searchParams.set('body', params.body);
+  if (params.trans) url.searchParams.set('trans', params.trans);
+  if (params.city) url.searchParams.set('city', params.city);
+  if (params.model) url.searchParams.set('model', params.model);
+  if (params.mode) url.searchParams.set('mode', params.mode); // 'cash' | 'financing'
+  if (params.cashMin != null) url.searchParams.set('cash_min', String(params.cashMin));
+  if (params.cashMax != null) url.searchParams.set('cash_max', String(params.cashMax));
+  if (params.allInMin != null) url.searchParams.set('allin_min', String(params.allInMin));
+  if (params.allInMax != null) url.searchParams.set('allin_max', String(params.allInMax));
+  url.searchParams.set('limit', '20');
+
+  const res = await fetch(url.toString(), { method: 'GET', headers: { 'Accept': 'application/json' }});
+  if (!res.ok) throw new Error(`Inventory HTTP ${res.status}`);
+  return await res.json(); // expects {ok, count, items: [...]}
+}
+
+function prioritize(items) {
+  const pri = items.filter(x => (x.price_status || '').toLowerCase() === 'priority');
+  const rest = items.filter(x => (x.price_status || '').toLowerCase() !== 'priority');
+  return [...pri, ...rest];
+}
+
+function pickTopTwo(items) {
+  const arr = prioritize(items);
+  return arr.slice(0, 2);
+}
+
+function shortCaption(item, index) {
+  const n = index + 1;
+  const yr = item.year ? `${item.year} ` : '';
+  const name = [yr, item.brand, item.model, item.variant || ''].filter(Boolean).join(' ').replace(/\s+/g,' ').trim();
+  const allin = item.all_in || item.price_all_in || item['all-in'] || item.allin;
+  const km = item.mileage ? `${item.mileage.toLocaleString()} km` : '';
+  const city = item.city || (item.complete_address || '').split(',')[0];
+  const priceLine = allin ? `All-in: ₱${Number(allin).toLocaleString()}` : (item.srp ? `Cash: ₱${Number(item.srp).toLocaleString()}` : '');
+  const locLine = [city, km].filter(Boolean).join(' — ');
+  return `#${n} ${name}\n${priceLine}\n${locLine}`;
+}
+
+// ---- LLM helper (for tone + micro rephrasings, optional) ----
+async function llmRewrite(system, user) {
+  try {
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: pickModel(MODEL_DEFAULT),
+        temperature: pickTemp(TEMP_DEFAULT, 0.3),
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: user }
+        ],
+      })
+    });
+    const data = await res.json();
+    return (data.choices?.[0]?.message?.content || '').trim();
+  } catch {
+    return user; // fallback to raw text
+  }
+}
+
+// ---- Qualifier flow ----
+async function askNextQuestion(senderId, state) {
+  const { info } = state;
+
+  if (!state.greetDone) {
+    state.greetDone = true;
+    const msg = `Hi! You're talking to your personal BentaCars advisor. 👋
+Before ko i-match, a few quick questions para mahanap ko agad ang best deal (no endless scrolling).`;
+    await sendText(senderId, msg);
+  }
+
+  // 1) Payment
+  if (!info.payment) {
+    await sendText(senderId, `Una: **Cash** ba o **Financing** ang plan mo? 🙂`);
+    return;
+  }
+
+  // 2) Location
+  if (!info.location) {
+    await sendText(senderId, `Saan location ninyo? (city/province)`);
+    return;
+  }
+
+  // 3) Body type
+  if (!info.body) {
+    await sendText(senderId, `May preferred **body type** ka ba? (e.g., sedan, suv, mpv, van, pickup — o ‘any’)`);
+    return;
+  }
+
+  // 4) Transmission
+  if (!info.trans) {
+    await sendText(senderId, `Transmission? (automatic / manual — pwede ring ‘any’)`);
+    return;
+  }
+
+  // 5) Budget last
+  if (info.payment === 'cash' && !info.budgetCash) {
+    await sendText(senderId, `Magkano ang **cash budget range** mo? (e.g., 450k-600k o ‘below 600k’)`);
+    return;
+  }
+  if (info.payment === 'financing' && !info.budgetAllIn) {
+    await sendText(senderId, `Magkano ang **ready cash-out / all-in** range? (e.g., 150k-220k)`);
+    return;
+  }
+
+  // Ready to search
+  state.phase = 'offer';
+  await sendText(senderId, `GOT IT! ✅ I’ll search the best matches now based on details mo.`);
+  await doOffer(senderId, state);
+}
+
+async function doOffer(senderId, state) {
+  const { info } = state;
+
+  const params = {
+    mode: info.payment,
+    body: info.body === 'any' ? '' : info.body,
+    trans: info.trans === 'any' ? '' : info.trans,
+    city: info.location,
+    model: info.model || '',
+  };
+  if (info.payment === 'cash' && info.budgetCash) {
+    params.cashMin = info.budgetCash.min;
+    params.cashMax = info.budgetCash.max;
+  }
+  if (info.payment === 'financing' && info.budgetAllIn) {
+    params.allInMin = info.budgetAllIn.min;
+    params.allInMax = info.budgetAllIn.max;
+  }
+
+  await sendTypingOn(senderId);
+  let data;
+  try {
+    data = await queryInventory(params);
+  } catch (e) {
+    await sendTypingOff(senderId);
+    await sendText(senderId, `Nagka-issue sa inventory search. Paki-try ulit in a moment 🙏`);
+    return;
+  }
+  await sendTypingOff(senderId);
+
+  const items = Array.isArray(data?.items) ? data.items : [];
+  if (!items.length) {
+    await sendText(senderId, `Wala pang exact match. Okay bang **i-expand** ng kaunti ang budget o nearby cities para may maipakita ako?`);
+    state.phase = 'qualify';
+    return;
+  }
+
+  const top = pickTopTwo(items);
+  if (!top.length) {
+    await sendText(senderId, `Wala pang exact match. G gusto mo bang magbukas tayo ng ibang options (ibang model/body type)?`);
+    state.phase = 'qualify';
+    return;
+  }
+
+  await sendText(senderId, `Ito yung best na swak sa details mo (priority muna if available):`);
+
+  // send each with image_1 + caption
+  for (let i = 0; i < top.length; i++) {
+    const car = top[i];
+    const img = car.image_1 || car.image1 || '';
+    if (img) await sendImage(senderId, img);
+    await sendText(senderId, shortCaption(car, i));
+  }
+
+  state.offered = top;
+  state.phase = 'await_selection';
+  await sendText(senderId, `If you like one, reply with **1** or **2** to see full photos. Kung gusto mong ibang options, sabihin mo lang (e.g., “ibang van” or “ibang model”).`);
+}
+
+async function sendFullPhotos(senderId, item) {
+  const urls = [];
+  for (let i = 1; i <= 10; i++) {
+    const key = `image_${i}`;
+    const v = item[key];
+    if (v && typeof v === 'string' && v.startsWith('http')) urls.push(v);
+  }
+  if (!urls.length && item.image1) {
+    // fallback naming
+    for (let i = 1; i <= 10; i++) {
+      const key = `image${i}`;
+      if (item[key]) urls.push(item[key]);
+    }
+  }
+  if (!urls.length) {
+    await sendText(senderId, `Wala pang additional photos sa record ko for this unit—pwede ko i-request sa dealer ngayon. ✅`);
+    return;
+  }
+  await sendText(senderId, `Here are the full photos for your selected unit:`);
+  for (const u of urls) {
+    await sendImage(senderId, u);
+  }
+  await sendText(senderId, `Gusto mo ba i-schedule ang viewing? Sabihin mo lang “schedule viewing” kung ready ka.`);
+}
+
+// -------------- Messenger plumbing --------------
 export default async function handler(req, res) {
   try {
-    if (req.method === 'GET') {
-      // Verification
+    // Vercel recently requires raw body parsing; guard both
+    const method = req.method;
+    if (method === 'GET') {
       const mode = req.query['hub.mode'];
       const token = req.query['hub.verify_token'];
       const challenge = req.query['hub.challenge'];
-      if (mode === 'subscribe' && token === process.env.FB_VERIFY_TOKEN) {
+      if (mode === 'subscribe' && token === FB_VERIFY_TOKEN) {
         return res.status(200).send(challenge);
       }
       return res.status(403).send('Forbidden');
     }
 
-    if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
+    if (method === 'POST') {
+      const body = typeof req.body === 'object' ? req.body
+                  : (typeof req.json === 'function' ? await req.json() : {});
 
-    const body = req.body || {};
-    if (!body.object) return res.status(200).send('OK'); // Not a Messenger webhook
+      // Basic guard
+      if (!body || body.object !== 'page') return res.status(200).send('ok');
 
-    for (const entry of body.entry || []) {
-      for (const event of entry.messaging || []) {
-        const senderId = event.sender && event.sender.id;
-        if (!senderId) continue;
+      for (const entry of body.entry || []) {
+        for (const event of entry.messaging || []) {
+          const senderId = event.sender?.id;
+          if (!senderId) continue;
 
-        const session = initSession(senderId);
-
-        // Handle text
-        if (event.message && event.message.text) {
-          const text = event.message.text.trim();
-
-          // Commands
-          if (isRestart(text)) {
-            SESSIONS.delete(senderId);
-            initSession(senderId);
-            await sendText(senderId, "Okay! Let's start fresh. Consultant mode tayo—goal namin ma-match ka sa **best unit** (no endless scrolling).");
-            await sendQuickReplies(senderId, "Una: Cash ba o Financing ang plan mo? 🙂", [
-              {title:'Cash', payload:'PAYMENT_CASH'},
-              {title:'Financing', payload:'PAYMENT_FINANCING'}
-            ]);
-            continue;
-          }
-
-          // If in selection mode expecting a choice by title or number
-          if (session.phase === 'offer') {
-            // Choosing unit by quick reply title or “1/2”
-            const idxNum = text.match(/^\s*([12])\s*$/);
-            let chosen = null;
-            if (idxNum) {
-              chosen = session.lastOffers[Number(idxNum[1])-1];
-            } else {
-              chosen = session.lastOffers.find(c => new RegExp(c.brand_model||'', 'i').test(text) || new RegExp(c.model||'', 'i').test(text));
-            }
-
-            if (isMorePhotos(text) && session.selected) {
-              const imgs = carImages(session.selected);
-              if (imgs.length) {
-                await sendTypingOn(senderId);
-                // Try gallery first
-                const elements = imgs.map(u => ({ title: session.selected.brand_model || session.selected.model || 'Vehicle', image_url: u }));
-                const ok = await sendGenericTemplate(senderId, elements.slice(0,10));
-                if (!ok) {
-                  for (const url of imgs) await sendImage(senderId, url);
-                }
-                await sendTypingOff(senderId);
-              } else {
-                await sendText(senderId, "Wala pang full set ng photos for this unit. I’ll request more from the dealer. 🙂");
-              }
-              continue;
-            }
-            if (isShowOthers(text)) {
-              // show the next 2 (if any were fetched)
-              const next2 = session.lastOffers.slice(2,4);
-              if (next2.length) {
-                await showTopTwo(senderId, next2, 'Other options na swak din:');
-                session.lastOffers = next2; // update window
-                session.selected = null;
-              } else {
-                await sendText(senderId, "Sige! Maghahanap pa ako ng ibang options and I’ll message you. 🙂");
-              }
-              continue;
-            }
-            if (isSchedule(text)) {
-              await sendText(senderId, "Great! I’ll coordinate the viewing schedule. Pakisend ng **contact number** mo at preferred day/time. 📅");
-              continue;
-            }
-
-            if (chosen) {
-              session.selected = chosen;
-              await sendText(senderId, buildCaption(chosen));
-              await sendQuickReplies(senderId, "Gusto mo bang makita ang **full photos** o **i-schedule** natin ang viewing?", [
-                {title:'View full photos', payload:'MORE_PHOTOS'},
-                {title:'Schedule viewing', payload:'SCHEDULE_VIEWING'},
-                {title:'Show other options', payload:'SHOW_OTHERS'}
-              ]);
-              continue;
-            }
-          }
-
-          // Otherwise we’re in qualifying
-          const col = session.collected;
-          const hints = detectHints(text);
-
-          // Apply hints
-          col.payment      = col.payment      || hints.payment || col.payment;
-          col.body_type    = col.body_type    || hints.body_type || col.body_type;
-          col.transmission = col.transmission || hints.transmission || col.transmission;
-          col.brand        = col.brand        || hints.brand || col.brand;
-          col.model        = col.model        || hints.model || col.model;
-          col.year         = col.year         || hints.year  || col.year;
-          if (hints.budget_cash && col.payment === 'cash' && !col.budget_cash) col.budget_cash = hints.budget_cash;
-
-          // Step-by-step prompts
-          const need = stillNeeds({
-            payment: col.payment,
-            location: col.location,
-            body_type: col.body_type,
-            transmission: col.transmission,
-            budget_cash: col.budget_cash,
-            budget_allin: col.budget_allin,
-            model: col.model,
-            brand: col.brand
-          });
-
-          if (need === 'payment') {
-            await sendQuickReplies(senderId, "Una: Cash ba o Financing ang plan mo? 🙂", [
-              {title:'Cash', payload:'PAYMENT_CASH'},
-              {title:'Financing', payload:'PAYMENT_FINANCING'}
-            ]);
-            continue;
-          }
-          if (!col.location) {
-            col.location = normalizeText(text); // treat the last user message as location if not recognized elsewhere
-            if (!col.location || col.location.length < 2) {
-              await sendText(senderId, "Saan location ninyo? (city/province)");
-              continue;
-            } else {
-              await sendText(senderId, `Got it, location: ${col.location} ✅`);
-            }
-          }
-          if (!col.body_type && !(col.model || col.brand)) {
-            await sendQuickReplies(senderId, "Body type preferred? (pwede ring 'any')", [
-              {title:'Sedan', payload:'BODY_SEDAN'},
-              {title:'SUV', payload:'BODY_SUV'},
-              {title:'MPV', payload:'BODY_MPV'},
-              {title:'Van', payload:'BODY_VAN'},
-              {title:'Pickup', payload:'BODY_PICKUP'},
-              {title:'Any', payload:'BODY_ANY'}
-            ]);
-            continue;
-          }
-          if (!col.transmission && !col.model) {
-            await sendQuickReplies(senderId, "Transmission?", [
-              {title:'Automatic', payload:'TRANS_AUTO'},
-              {title:'Manual', payload:'TRANS_MANUAL'},
-              {title:'Any', payload:'TRANS_ANY'}
-            ]);
-            continue;
-          }
-          if (col.payment === 'cash' && !col.budget_cash) {
-            await sendText(senderId, "Magkano ang **budget range** mo (cash)? Hal: ₱450k to ₱600k, or 'below 700k'.");
-            continue;
-          }
-          if (col.payment === 'financing' && !col.budget_allin) {
-            await sendText(senderId, "Magkano ang **ready cash-out** / all-in budget mo? Hal: ₱100k to ₱150k.");
-            continue;
-          }
-
-          // All set → search
-          await sendText(senderId, "GOT IT! ✅ I now have everything I need. I can now search available units for you.");
-          session.phase = 'offer';
-
-          // Build query to API
-          const apiParams = {
-            payment: col.payment,
-            location: col.location,
-            body_type: col.body_type || null,
-            transmission: col.transmission || null,
-            budget_cash_min: col.budget_cash?.min || null,
-            budget_cash_max: col.budget_cash?.max || null,
-            budget_allin_min: col.budget_allin?.min || null,
-            budget_allin_max: col.budget_allin?.max || null,
-            brand: col.brand || null,
-            model: col.model || null,
-            year:  col.year  || null
-          };
-
+          // typing indicator light touch
           await sendTypingOn(senderId);
-          let cars = [];
-          try {
-            const raw = await fetchInventory(apiParams);
-            // score + pick, priority-first but fallback to others if empty
-            cars = scoreAndSelect(raw, {
-              wanted: 4,
-              preferPriority: true,
-              body_type: col.body_type,
-              transmission: col.transmission,
-              model: col.model,
-              brand: col.brand,
-              payment: col.payment,
-              budget_cash: col.budget_cash,
-              budget_allin: col.budget_allin
-            });
-          } catch (e) {
+
+          // restart logic
+          const text = event.message?.text || event.postback?.title || '';
+          if (text && isRestart(text)) {
+            resetState(senderId);
             await sendTypingOff(senderId);
-            await sendText(senderId, "Medyo nag-timeout ang inventory. Subukan ko ulit saglit…");
-            continue;
-          }
-          await sendTypingOff(senderId);
-
-          if (!cars.length) {
-            await sendText(senderId, "Walang exact match. Okay ba i-expand ng kaunti ang budget o nearby cities para may maipakita ako?");
+            await sendText(senderId, `✅ New search started. Let’s begin fresh.`);
+            const st = getState(senderId);
+            await askNextQuestion(senderId, st);
             continue;
           }
 
-          // Present top 2; Priority first if present (handled inside scoreAndSelect)
-          const top2 = cars.slice(0,2);
-          session.lastOffers = cars.slice(0,4); // keep a window for “other options”
+          const state = getState(senderId);
+          state.lastMsgTime = Date.now();
 
-          await showTopTwo(senderId, top2, "Ito yung best na swak sa details mo (priority muna).");
-
-          // Quick replies with choices
-          const qr = top2.map((c,i)=>({title:`${c.year||''} ${c.brand||''} ${c.model||''}`.trim(), payload:`CHOOSE_${i+1}`}));
-          qr.push({title:'Show other options', payload:'SHOW_OTHERS'});
-          await sendQuickReplies(senderId, "Anong unit ang pipiliin mo?", qr);
-          continue;
-        }
-
-        // Postbacks / payloads
-        if (event.postback && event.postback.payload) {
-          const payload = event.postback.payload;
-          // (optional) handle here if you add postback buttons
-        }
-
-        if (event.message && event.message.quick_reply && event.message.quick_reply.payload) {
-          const pl = event.message.quick_reply.payload;
-          const session = initSession(senderId);
-          const col = session.collected;
-
-          if (pl === 'PAYMENT_CASH')       col.payment = 'cash';
-          if (pl === 'PAYMENT_FINANCING')  col.payment = 'financing';
-          if (pl === 'BODY_SEDAN')         col.body_type = 'sedan';
-          if (pl === 'BODY_SUV')           col.body_type = 'suv';
-          if (pl === 'BODY_MPV')           col.body_type = 'mpv';
-          if (pl === 'BODY_VAN')           col.body_type = 'van';
-          if (pl === 'BODY_PICKUP')        col.body_type = 'pickup';
-          if (pl === 'BODY_ANY')           col.body_type = 'any';
-          if (pl === 'TRANS_AUTO')         col.transmission = 'automatic';
-          if (pl === 'TRANS_MANUAL')       col.transmission = 'manual';
-          if (pl === 'TRANS_ANY')          col.transmission = 'any';
-
-          if (/^CHOOSE_[12]$/.test(pl)) {
-            const idx = Number(pl.split('_')[1]) - 1;
-            const chosen = session.lastOffers[idx];
-            if (chosen) {
-              session.selected = chosen;
-              await sendText(senderId, buildCaption(chosen));
-              await sendQuickReplies(senderId, "Gusto mo bang makita ang **full photos** o **i-schedule** natin ang viewing?", [
-                {title:'View full photos', payload:'MORE_PHOTOS'},
-                {title:'Schedule viewing', payload:'SCHEDULE_VIEWING'},
-                {title:'Show other options', payload:'SHOW_OTHERS'}
-              ]);
-              return res.status(200).send('OK');
+          // Returning user friendly hello (no buttons)
+          if (!state.greetDone) {
+            if (state.createdAt && Date.now() - state.createdAt > 60_000) {
+              await sendText(senderId, `Welcome back! ✅ We can continue from last details, or say “restart” to start over.`);
             }
           }
-          if (pl === 'MORE_PHOTOS') {
-            if (session.selected) {
-              const imgs = carImages(session.selected);
-              if (imgs.length) {
-                await sendTypingOn(senderId);
-                const elements = imgs.map(u => ({ title: session.selected.brand_model || session.selected.model || 'Vehicle', image_url: u }));
-                const ok = await sendGenericTemplate(senderId, elements.slice(0,10));
-                if (!ok) {
-                  for (const url of imgs) await sendImage(senderId, url);
-                }
-                await sendTypingOff(senderId);
-              } else {
-                await sendText(senderId, "Wala pang full set ng photos for this unit. I’ll request more from the dealer. 🙂");
+
+          // If currently awaiting selection and user chose 1 or 2
+          const choiceMatch = (event.message?.text || '').trim().match(/^\s*[#\[]?\s*(\d{1,2})\s*[\]\.]?\s*$/);
+          if (state.phase === 'await_selection' && choiceMatch) {
+            const idx = Number(choiceMatch[1]) - 1;
+            const picked = state.offered[idx];
+            if (picked) {
+              await sendTypingOff(senderId);
+              await sendFullPhotos(senderId, picked);
+              state.phase = 'followup';
+              continue;
+            }
+          }
+
+          // Parse any info from free text (natural chat)
+          const msg = event.message?.text || '';
+          if (msg) {
+            // detect & fill missing fields
+            if (!state.info.payment) {
+              const p = detectPayment(msg);
+              if (p) state.info.payment = p;
+            }
+            if (!state.info.body) {
+              const b = detectBody(msg);
+              if (b) state.info.body = b;
+            }
+            if (!state.info.trans) {
+              const tr = detectTransmission(msg);
+              if (tr) state.info.trans = tr;
+            }
+            if (!state.info.model) {
+              const mm = detectModel(msg);
+              if (mm) state.info.model = mm;
+            }
+
+            // location heuristic: if looks like a place and not a command
+            if (!state.info.location) {
+              // simple guess: if the message contains 'city' or is short (~2 words), treat as location
+              if (/\bcity|province|qc|quezon|manila|makati|pasig|mandaluyong|taguig|cainta|cavite|laguna|bulacan|antipolo|paranaque|las pinas|valenzuela|caloocan|malabon|navotas/i.test(msg)) {
+                state.info.location = msg.trim();
               }
-            } else {
-              await sendText(senderId, "Please pick a unit first. 🙂");
             }
-          }
-          if (pl === 'SCHEDULE_VIEWING') {
-            await sendText(senderId, "Great! I’ll coordinate the viewing schedule. Pakisend ng **contact number** mo at preferred day/time. 📅");
-          }
-          if (pl === 'SHOW_OTHERS') {
-            const next2 = session.lastOffers.slice(2,4);
-            if (next2.length) {
-              await showTopTwo(senderId, next2, 'Other options na swak din:');
-              session.lastOffers = next2;
-              session.selected = null;
-            } else {
-              await sendText(senderId, "Sige! Maghahanap pa ako ng ibang options and I’ll message you. 🙂");
+
+            // budget at the end depending on mode
+            if (state.info.payment === 'cash' && !state.info.budgetCash) {
+              const r = extractBudgetRange(msg);
+              if (r) state.info.budgetCash = r;
+            } else if (state.info.payment === 'financing' && !state.info.budgetAllIn) {
+              const r = extractBudgetRange(msg);
+              if (r) state.info.budgetAllIn = r;
             }
           }
 
-          return res.status(200).send('OK');
+          // Flow control
+          if (state.phase === 'offer' || state.phase === 'await_selection' || state.phase === 'followup') {
+            // If user typed a normal sentence while we wait selection, allow “show other” or “ibang options”
+            if (/ibang|other|more|iba pang|show more|ibang unit/i.test(msg)) {
+              state.phase = 'offer';
+              // clear last offered to fetch new
+              state.offered = [];
+              await doOffer(senderId, state);
+            } else if (state.phase !== 'await_selection') {
+              // continue qualifying or re-offer
+              await askNextQuestion(senderId, state);
+            }
+          } else {
+            // still qualifying
+            await askNextQuestion(senderId, state);
+          }
+
+          await sendTypingOff(senderId);
         }
       }
+      return res.status(200).send('ok');
     }
 
-    return res.status(200).send('OK');
+    return res.status(405).send('Method Not Allowed');
   } catch (err) {
     console.error('webhook error', err);
-    return res.status(500).send('webhook error');
-  }
-}
-
-// ----- presenters -----
-async function showTopTwo(senderId, cars, introText) {
-  await sendText(senderId, introText);
-
-  // Try gallery first (two cards)
-  const elements = cars.map(c => ({
-    title: `${c.year||''} ${c.brand||''} ${c.model||''}`.trim(),
-    subtitle: buildCaption(c).split('\n').slice(1).join(' • '),
-    image_url: carImages(c)[0] || c.image_1 || null,
-    buttons: [
-      { type: 'postback', title: 'View full photos', payload: 'MORE_PHOTOS' },
-      { type: 'postback', title: 'Schedule viewing', payload: 'SCHEDULE_VIEWING' }
-    ]
-  }));
-  const galleryOk = await sendGenericTemplate(senderId, elements);
-
-  if (!galleryOk) {
-    // Fallback: stacked image + caption
-    for (const c of cars) {
-      const img = carImages(c)[0];
-      if (img) await sendImage(senderId, img);
-      await sendText(senderId, buildCaption(c));
-    }
+    // Be resilient: don’t break the FB webhook handshake
+    try { return res.status(200).send('ok'); } catch {}
   }
 }
