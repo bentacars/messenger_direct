@@ -1,348 +1,367 @@
 // api/webhook.js
-import { sendText, sendImage } from './lib/messenger.js';
-import { matchTopTwo, parseInventoryItem, fetchInventory } from './lib/matching.js';
+import fetch from 'node-fetch';
+import {
+  sendText,
+  sendTypingOn,
+  sendTypingOff,
+  sendImage
+} from './lib/messenger.js';
+import {
+  adaptTone,
+  smartShort,
+  remember,
+  recall,
+  forgetIfRestart,
+  extractClues
+} from './lib/llm.js';
 
 const VERIFY_TOKEN = process.env.FB_VERIFY_TOKEN;
-const INVENTORY_URL = process.env.INVENTORY_API_URL;
-const ENABLE_TONE = (process.env.ENABLE_TONE_LLM || '0') === '1';
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.OPENAT_API_KEY;
-const MODEL_DEFAULT = process.env.MODEL_DEFAULT || 'gpt-4.1';
-const TEMP_DEFAULT = Number(process.env.TEMP_DEFAULT ?? 0.30);
+const PAGE_TOKEN   = process.env.FB_PAGE_TOKEN;
+const INVENTORY_API_URL = process.env.INVENTORY_API_URL;
 
-// ---------- Optional tone rewriter (Taglish, friendly, expert) ----------
-async function maybeHumanize(text) {
-  if (!ENABLE_TONE || !OPENAI_API_KEY) return text;
-  try {
-    const res = await fetch('https://api.openai.com/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: MODEL_DEFAULT,
-        temperature: TEMP_DEFAULT,
-        messages: [
-          {
-            role: 'system',
-            content:
-              "You are a warm, human-sounding Filipino car sales consultant (Taglish). " +
-              "Be short, friendly, and expert. Build light rapport but keep it efficient. " +
-              "Avoid robotic phrasing and avoid emoji spam (0–1 emoji max). " +
-              "No quick-reply buttons or lists—sound like a real person."
-          },
-          { role: 'user', content: text }
-        ]
-      })
-    });
-    const data = await res.json();
-    return (data.choices?.[0]?.message?.content || text).trim();
-  } catch {
-    return text;
-  }
-}
-async function talk(psid, text) { await sendText(psid, await maybeHumanize(text)); }
+// Best-effort in-memory session store (serverless may reset on cold starts)
+const SESS = new Map();
 
-// ---------- Minimal name sniff (safe if profile absent) ----------
-function detectName(event) {
-  try {
-    const prof =
-      event?.sender?.profile ||
-      event?.message?.nlp?.entities?.profile?.[0] ||
-      event?.context?.user_profile ||
-      null;
-    const full = prof?.name || prof?.first_name || null;
-    if (!full) return null;
-    const first = String(full).trim().split(/\s+/)[0];
-    return first ? first.charAt(0).toUpperCase() + first.slice(1).toLowerCase() : null;
-  } catch { return null; }
-}
-
-// ---------- Ephemeral in-memory session ----------
-const SESSIONS = new Map();
-const TTL_MS = (parseInt(process.env.MEMORY_TTL_DAYS || '7', 10)) * 24 * 60 * 60 * 1000;
-const now = () => Date.now();
 function getSession(psid) {
-  const s = SESSIONS.get(psid);
-  if (!s) return null;
-  if (now() - s.updatedAt > TTL_MS) { SESSIONS.delete(psid); return null; }
-  return s;
-}
-function ensureSession(psid) {
-  const s = getSession(psid) || {
-    phase: 'start',    // start -> plan -> location -> body -> trans -> budget -> ready
-    plan: null,        // 'cash' | 'financing'
-    location: null,
-    body: null,        // sedan/suv/mpv/van/pickup/any
-    trans: null,       // automatic/manual/any
-    budget: null,      // text range
-    modelHint: null,   // optional ("vios", etc.)
-    offer: null,       // last offered 2 items
-    name: null
-  };
-  s.updatedAt = now();
-  SESSIONS.set(psid, s);
-  return s;
-}
-function resetSession(psid) { SESSIONS.delete(psid); }
-
-// ---------- Text helpers ----------
-const normalize = (t = '') => t.trim().toLowerCase();
-const isRestart = (t) => /^(restart|start over|reset|ulit tayo|bagong search|new inquiry)$/.test(normalize(t));
-function parsePlan(t) { const s = normalize(t); if (/\bcash\b/.test(s)) return 'cash'; if (/financ/.test(s)) return 'financing'; return null; }
-function parseBody(t) { const s = normalize(t); if (/\bsedan\b/.test(s)) return 'sedan'; if (/\bsuv\b/.test(s)) return 'suv'; if (/\bmpv\b/.test(s)) return 'mpv'; if (/\bvan\b/.test(s)) return 'van'; if (/\bpick(?: ?up)?\b/.test(s)) return 'pickup'; if (/\bany\b/.test(s)) return 'any'; return null; }
-function parseTrans(t){ const s = normalize(t); if (/auto/.test(s)) return 'automatic'; if (/manu/.test(s)) return 'manual'; if (/\bany\b/.test(s)) return 'any'; return null; }
-function parsePick(t) { const s = normalize(t); const m = s.match(/\b([12])\b/); return m ? parseInt(m[1], 10) : null; }
-function validText(t) { return t && t.trim().length >= 2; }
-function sniffModelHint(t = '') {
-  const m = t.match(/\b(vios|mirage|city|accent|fortuner|innova|xtrail|civic|corolla|nv350|hiace|raize|br-v|livina|terra|urvan)\b/i);
-  return m ? m[0] : null;
-}
-function prettyTitle(item) {
-  const year = item.year ? String(item.year) : '';
-  const brand = item.brand || '';
-  const model = item.model || '';
-  const variant = item.variant ? (' ' + item.variant) : '';
-  return `${year} ${brand} ${model}${variant}`.trim();
+  if (!SESS.has(psid)) {
+    SESS.set(psid, {
+      name: null,
+      prefs: {
+        plan: null,          // 'cash' | 'financing'
+        city: null,          // 'quezon city', etc.
+        body: null,          // sedan/suv/mpv/van/pickup/any
+        trans: null,         // automatic/manual/any
+        budgetMin: null,     // numbers (cash)
+        budgetMax: null,
+        dpMin: null,         // numbers (financing)
+        dpMax: null,
+        model: null,         // optional explicit model
+        year: null           // optional year
+      },
+      last: Date.now()
+    });
+  }
+  return SESS.get(psid);
 }
 
-// ---------- Copy (human-friendly) ----------
-const COPY = {
-  welcomeNew: (name) =>
-    `Hi${name ? ' ' + name : ''}! 👋 I’m your BentaCars consultant. ` +
-    `Tutulungan kitang ma-match sa best unit para hindi ka na endless scroll. ` +
-    `Quick lang — cash payment ka ba or financing plan?`,
-  welcomeBack: (snap) =>
-    `Welcome back! 👋 Last time, noted ko ito: ${snap}. ` +
-    `Gusto mo bang ituloy yan, or type **restart** para magsimula ulit?`,
-  askPlan: `Para ma-match ka nang maayos, cash ba o financing ang plan mo? 🙂`,
-  ackPlan: (p) => `Got it — ${p.toUpperCase()} ✅`,
-  askLocation: `Saan ka base para madaling tingnan ang malapit na units? (city/province)`,
-  ackLocation: (loc) => `Sige, ${loc}. Marami tayong ma-check diyan. ✅`,
-  askBody: `Anong type ang gusto mo? Sedan, SUV, MPV, Van, Pickup — or **any** kung flexible ka.`,
-  ackBody: (b) => `Copy — ${b} type. ✅`,
-  askTrans: `Transmission? Automatic o Manual — pwede ring **any**.`,
-  ackTrans: (t) => `Noted — ${t}. ✅`,
-  askBudgetCash: `Last na: mga magkano ang **cash budget** mo? (hal. ₱450k–₱600k)`,
-  askBudgetFin: `Last na: mga magkano ang **ready cash-out / all-in** range mo? (hal. 150k–220k)`,
-  ackBudget: `Salamat! ✅ Sapat na yan para ma-filter ko nang ayos.`,
-  searching: `Sige, i-scan ko na ang inventory para sa pinaka-swak na dalawa (priority muna kung meron).`,
-  offerIntro: `Ito yung pinaka-swak sa details mo (Priority muna kung available):`,
-  proceedNonPriority: `Walang Priority sa filter mo, kaya nag-proceed ako sa best matches na available.`,
-  whichPick: `Alin ang mas gusto mo, #1 o #2? Pwede mo rin sabihin ang model name.`,
-  galleryHint: `Gusto mo ng full photos? Sabihin mo: “more photos” o “full photos of #1/#2”.`,
-  nothingFound: `Walang pasok sa sobrang higpit ng filter. Okay bang i-relax natin ng kaunti (budget o nearby cities) para may maipakita agad?`,
-  afterPick: (title) => `Great choice! ${title}. Isesend ko ang full photos — then pwede na tayong mag-schedule ng viewing.`
-};
+function normalize(str) {
+  return (str||'').toString().trim().toLowerCase();
+}
 
-// ---------- Public webhook ----------
-export default async function handler(req, res) {
+// ---------- FB Webhook handshake ----------
+export async function GET(req) {
+  const { searchParams } = new URL(req.url);
+  const mode   = searchParams.get('hub.mode');
+  const token  = searchParams.get('hub.verify_token');
+  const chall  = searchParams.get('hub.challenge');
+  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+    return new Response(chall, { status: 200 });
+  }
+  return new Response('forbidden', { status: 403 });
+}
+
+// ---------- Main handler ----------
+export async function POST(req) {
   try {
-    if (req.method === 'GET') {
-      const mode = req.query['hub.mode'];
-      const token = req.query['hub.verify_token'];
-      const challenge = req.query['hub.challenge'];
-      if (mode === 'subscribe' && token === VERIFY_TOKEN) return res.status(200).send(challenge);
-      return res.status(403).send('Forbidden');
-    }
-    if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
-
-    // Vercel usually gives req.body; if not, try json()
-    let body = req.body;
-    if (!body || (typeof body === 'string' && !body.length)) {
-      try { body = await req.json(); } catch { body = null; }
-    }
-    if (!body || body.object !== 'page') return res.status(200).json({ ok: true });
+    const body = await req.json();
+    if (body.object !== 'page') return new Response('ignored', { status: 200 });
 
     for (const entry of body.entry || []) {
-      for (const event of entry.messaging || []) {
-        const psid = event?.sender?.id;
+      for (const ev of entry.messaging || []) {
+        const psid = ev.sender && ev.sender.id;
         if (!psid) continue;
 
-        if (event.message?.text) {
-          await onText(psid, event.message.text, event);
-        } else if (event.postback?.payload) {
-          await onText(psid, event.postback.payload, event);
+        if (ev.message && ev.message.text) {
+          await handleText(psid, ev.message.text);
+        } else if (ev.postback && ev.postback.payload) {
+          // We avoid buttons, but keep safety for future
+          await handleText(psid, ev.postback.payload);
         }
       }
     }
-    return res.status(200).json({ ok: true });
+    return new Response('ok', { status: 200 });
   } catch (e) {
     console.error('webhook error', e);
-    return res.status(200).json({ ok: false, error: String(e) });
+    return new Response('error', { status: 500 });
   }
 }
 
-// ---------- Conversation engine ----------
-async function onText(psid, rawText, event) {
-  const text = rawText || '';
-  const s = ensureSession(psid);
-  if (!s.name) s.name = detectName(event) || null;
+// ---------- Conversation Logic ----------
+const ORDER = ['plan','city','body','trans','budget']; // budget last
 
-  // Restart
-  if (isRestart(text)) {
-    resetSession(psid);
-    const ns = ensureSession(psid);
-    await talk(psid, COPY.welcomeNew(s.name));
-    ns.phase = 'plan';
-    return;
+async function handleText(psid, raw) {
+  const msg = normalize(raw);
+  const session = getSession(psid);
+
+  // restart logic
+  if (await forgetIfRestart(msg, psid, session)) {
+    await sendText(PAGE_TOKEN, psid, "Sige, start tayo ulit. 👌");
+    session.prefs = getSession(psid).prefs; // reset done in forget
+    return askNext(psid, session, true);
   }
 
-  // Model hint anytime
-  const mh = sniffModelHint(text);
-  if (mh) s.modelHint = mh;
+  // Auto-clue extraction (model/year/body/etc.)
+  extractClues(msg, session);
 
-  // Greet
-  if (s.phase === 'start') {
-    const snap = snapshotQual(s);
-    if (snap) {
-      await talk(psid, COPY.welcomeBack(snap));
+  // Memory recall (returning user small welcome)
+  const wasSeen = !!recall(psid);
+  remember(psid); // update last seen
+
+  // Lightweight intent: greetings don’t spam questions
+  if (/^(hi|hello|hey|good\s*(am|pm|day)|kumusta|hoy)\b/.test(msg)) {
+    const line = wasSeen
+      ? "Welcome back! Ready ka bang maghanap ng unit ngayon?"
+      : "Hi! Tutulungan kitang ma-match sa best used car — no endless scrolling. 🙂";
+    await sendText(PAGE_TOKEN, psid, smartShort(adaptTone(line, msg)));
+    return askNext(psid, session, false);
+  }
+
+  // Persist answers according to what we’re asking for next
+  await captureAnswer(psid, msg, session);
+
+  // If qualified, search & offer; else ask next
+  if (isQualified(session)) {
+    await sendTypingOn(PAGE_TOKEN, psid);
+    const units = await findBestUnits(session);
+    await sendTypingOff(PAGE_TOKEN, psid);
+
+    if (!units.length) {
+      // Expand softly (no disappointment)
+      await sendText(
+        PAGE_TOKEN,
+        psid,
+        smartShort(adaptTone(
+          "Walang exact priority match, pero may nakita akong malalapit na options. Ipapadala ko yung unang dalawa.",
+          raw
+        ))
+      );
+    }
+    await offerTopTwo(psid, units, session);
+    await sendText(
+      PAGE_TOKEN,
+      psid,
+      smartShort("Sabihin mo lang: 'photos 1' o 'photos 2' para sa full gallery. Pwede ring 'iba pa' kung gusto mong maghanap ng alternatives.")
+    );
+  } else {
+    await askNext(psid, session, false);
+  }
+}
+
+async function captureAnswer(psid, msg, session) {
+  const p = session.prefs;
+
+  // plan
+  if (!p.plan) {
+    if (/\b(cash|spot\s*cash|cash\s*buyer)\b/.test(msg)) p.plan = 'cash';
+    if (/\b(finance|financing|loan|installment|hulog)\b/.test(msg)) p.plan = 'financing';
+  }
+
+  // city
+  if (!p.city) {
+    // accept “qc / quezon city / makati / cebu” etc.
+    const m = msg.match(/\b(qc|quezon city|manila|makati|pasig|pasay|mandaluyong|taguig|caloocan|valenzuela|marikina|muntinlupa|parañaque|las piñas|cebu|davao|iloilo|bacolod|pampanga|cavite|bulacan)\b/);
+    if (m) p.city = m[0];
+  }
+
+  // body
+  if (!p.body) {
+    const bodyMap = { sedan:1,suv:1,mpv:1,van:1,pickup:1, pick-up:1, 'pick up':1, any:1 };
+    const b = Object.keys(bodyMap).find(k => msg.includes(k));
+    if (b) p.body = b.replace('pick-up','pickup').replace('pick up','pickup');
+    // infer from model words
+    if (!p.body && /nv350|hiace|starex|traviz|urvan|vanette\b/.test(msg)) p.body = 'van';
+    if (!p.body && /vios|city|mirage|altis|elantra|accent|maze\b/.test(msg)) p.body = 'sedan';
+    if (!p.body && /fortuner|everest|montero|terra|raize|cx-5|cr-v|ranger|hilux|strada|navara\b/.test(msg)) p.body = 'suv';
+  }
+
+  // transmission
+  if (!p.trans) {
+    if (/\b(automatic|at|a/t)\b/.test(msg)) p.trans = 'automatic';
+    if (/\b(manual|mt|m/t|stick)\b/.test(msg)) p.trans = 'manual';
+    if (/\b(any)\b/.test(msg)) p.trans = 'any';
+  }
+
+  // model/year clues handled in extractClues()
+
+  // budget
+  if (!hasBudget(p)) {
+    // ranges like 450k-600k / 150–220k
+    const r = msg.match(/(\d{2,3})\s*[-–to]+\s*(\d{2,3})\s*k/i);
+    if (r) {
+      const a = Number(r[1])*1000, b = Number(r[2])*1000;
+      if (p.plan === 'cash') { p.budgetMin = Math.min(a,b); p.budgetMax = Math.max(a,b); }
+      else { p.dpMin = Math.min(a,b); p.dpMax = Math.max(a,b); }
+    }
+    // “below 600k / under 700k”
+    const under = msg.match(/\b(below|under|<=?)\s*(\d{2,3})k\b/i);
+    if (under) {
+      const cap = Number(under[2])*1000;
+      if (p.plan === 'cash') { p.budgetMin = 0; p.budgetMax = cap; }
+      else { p.dpMin = 0; p.dpMax = cap; }
+    }
+  }
+}
+
+function hasBudget(p) {
+  return p.plan === 'cash'
+    ? (p.budgetMin != null || p.budgetMax != null)
+    : (p.dpMin != null || p.dpMax != null);
+}
+
+function isQualified(session) {
+  const p = session.prefs;
+  return !!(p.plan && p.city && p.body && p.trans && hasBudget(p));
+}
+
+async function askNext(psid, session, forceWelcome=false) {
+  const p = session.prefs;
+
+  if (forceWelcome) {
+    await sendText(
+      PAGE_TOKEN,
+      psid,
+      smartShort("Let’s match you to the best used car (no endless scrolling).")
+    );
+  }
+
+  if (!p.plan) {
+    return sendText(PAGE_TOKEN, psid,
+      smartShort("Cash or financing ang plan mo?")
+    );
+  }
+  if (!p.city) {
+    return sendText(PAGE_TOKEN, psid,
+      smartShort("Saan location mo? (city/province)")
+    );
+  }
+  if (!p.body) {
+    return sendText(PAGE_TOKEN, psid,
+      smartShort("Preferred body type? (sedan/suv/mpv/van/pickup — or ‘any’)")
+    );
+  }
+  if (!p.trans) {
+    return sendText(PAGE_TOKEN, psid,
+      smartShort("Transmission? (automatic / manual — puwede ring ‘any’)")
+    );
+  }
+  if (!hasBudget(p)) {
+    if (p.plan === 'cash') {
+      return sendText(PAGE_TOKEN, psid,
+        smartShort("Magkano ang cash budget range? (e.g., 450k–600k o ‘below 600k’)")
+      );
     } else {
-      await talk(psid, COPY.welcomeNew(s.name));
-      s.phase = 'plan';
+      return sendText(PAGE_TOKEN, psid,
+        smartShort("Magkano ang ready cash-out / all-in range? (e.g., 150k–220k)")
+      );
     }
+  }
+}
+
+async function fetchInventory() {
+  const url = INVENTORY_API_URL;
+  const r = await fetch(url, { method:'GET', timeout: 20000 });
+  if (!r.ok) throw new Error(`inventory ${r.status}`);
+  const j = await r.json();
+  return j.items || j.rows || [];
+}
+
+function inRange(val, min, max) {
+  if (val == null) return false;
+  if (min != null && val < min) return false;
+  if (max != null && val > max) return false;
+  return true;
+}
+
+function chooseTopTwo(items, prefs) {
+  // Score by: Priority tag, body match, trans match, city proximity, model/year hint
+  const city = normalize(prefs.city||'');
+  const body = normalize(prefs.body||'any');
+  const trans = normalize(prefs.trans||'any');
+  const isCash = prefs.plan === 'cash';
+
+  const scored = items.map(x => {
+    const price = isCash ? Number(x.srp||0) : Number(x.all_in||0);
+    const bodyOk = !body || body==='any' || normalize(x.body_type||'')===body;
+    const transOk = !trans || trans==='any' || normalize(x.transmission||'')===trans;
+
+    const cityHit = city && normalize(x.city||'') === city ? 1 : 0;
+    const pri = /priority/i.test(x.price_status||'') ? 2 : 0;
+    const modelHit = prefs.model && normalize(x.model||'') === normalize(prefs.model) ? 1 : 0;
+    const yearHit = prefs.year && Number(x.year) === Number(prefs.year) ? 1 : 0;
+
+    let score = 0;
+    if (bodyOk) score += 2;
+    if (transOk) score += 2;
+    score += cityHit + modelHit + yearHit + pri;
+    return { x, price, score, pri };
+  });
+
+  // Budget filter
+  const budgetMin = isCash ? prefs.budgetMin : prefs.dpMin;
+  const budgetMax = isCash ? prefs.budgetMax : prefs.dpMax;
+
+  const filtered = scored.filter(s => inRange(s.price, budgetMin, budgetMax));
+
+  // If nothing in budget, soften: take closest ones
+  const base = filtered.length ? filtered : scored;
+
+  // Sort: Priority first, then score desc, then price asc
+  base.sort((a,b) => (b.pri - a.pri) || (b.score - a.score) || (a.price - b.price));
+  return base.slice(0,2).map(s => s.x);
+}
+
+async function findBestUnits(session) {
+  const all = await fetchInventory();
+  return chooseTopTwo(all, session.prefs);
+}
+
+function unitTitle(u) {
+  const name = `${u.year || ''} ${u.brand || ''} ${u.model || ''} ${u.variant || ''}`.replace(/\s+/g,' ').trim();
+  const city = u.city || (u.province||'');
+  const priceText = (u.all_in ? `All-in: ₱${Number(u.all_in).toLocaleString('en-PH')}`
+                              : `SRP: ₱${Number(u.srp||0).toLocaleString('en-PH')}`);
+  const km = u.mileage ? `${u.mileage.toLocaleString('en-PH')} km` : '';
+  return `🚗 ${name}\n${priceText}\n${city}${km?` — ${km}`:''}`;
+}
+
+async function offerTopTwo(psid, units, session) {
+  if (!units.length) {
+    await sendText(PAGE_TOKEN, psid, smartShort("Maghahanap pa ako ng lalabas na units sa budget mo. Pwede rin nating i-adjust nang kaunti ang filters mo."));
     return;
   }
+  const note = /priority/i.test(units[0]?.price_status||'') ? "Ito yung best na swak sa details mo (priority muna)." : "Ito yung best na swak sa details mo.";
+  await sendText(PAGE_TOKEN, psid, smartShort(note));
 
-  // FSM
-  switch (s.phase) {
-    case 'plan': {
-      const plan = parsePlan(text);
-      if (!plan) { await talk(psid, COPY.askPlan); return; }
-      s.plan = plan;
-      await talk(psid, COPY.ackPlan(plan));
-      await talk(psid, COPY.askLocation);
-      s.phase = 'location';
-      return;
-    }
-    case 'location': {
-      if (!validText(text)) { await talk(psid, COPY.askLocation); return; }
-      s.location = text.trim();
-      await talk(psid, COPY.ackLocation(s.location));
-      await talk(psid, COPY.askBody);
-      s.phase = 'body';
-      return;
-    }
-    case 'body': {
-      const b = parseBody(text);
-      if (!b) { await talk(psid, COPY.askBody); return; }
-      s.body = b;
-      await talk(psid, COPY.ackBody(b));
-      await talk(psid, COPY.askTrans);
-      s.phase = 'trans';
-      return;
-    }
-    case 'trans': {
-      const t = parseTrans(text);
-      if (!t) { await talk(psid, COPY.askTrans); return; }
-      s.trans = t;
-      await talk(psid, COPY.ackTrans(t));
-      if (s.plan === 'cash') await talk(psid, COPY.askBudgetCash);
-      else await talk(psid, COPY.askBudgetFin);
-      s.phase = 'budget';
-      return;
-    }
-    case 'budget': {
-      if (!validText(text)) {
-        if (s.plan === 'cash') await talk(psid, COPY.askBudgetCash);
-        else await talk(psid, COPY.askBudgetFin);
-        return;
-      }
-      s.budget = text.trim();
-      await talk(psid, COPY.ackBudget);
-      await talk(psid, COPY.searching);
-      s.phase = 'ready';
-      await offerMatches(psid, s);
-      return;
-    }
-    case 'ready': {
-      // Picks and gallery
-      const pick = parsePick(text);
-      if (pick) {
-        const chosen = s.offer?.[pick - 1];
-        if (chosen) {
-          await talk(psid, COPY.afterPick(prettyTitle(chosen)));
-          await sendFullGallery(psid, chosen);
-          return;
-        }
-      }
-      if (/more\s+photos|full\s+photos/i.test(text)) {
-        const chosen = s.offer?.[0];
-        if (chosen) { await sendFullGallery(psid, chosen); return; }
-      }
-      // Model pivot
-      if (mh) {
-        s.modelHint = mh;
-        await talk(psid, `Sige, titingnan ko ang options for ${mh}.`);
-        await offerMatches(psid, s);
-        return;
-      }
-      // Nudge
-      await talk(psid, `Kung may ibang target model ka, sabihin mo lang (hal. “Vios” o “NV350”). ` +
-                       `Kapag gusto mo ng ibang options, sabihin mo “hanap ulit”.`);
-      return;
-    }
-    default:
-      await talk(psid, COPY.askPlan);
-      s.phase = 'plan';
-  }
-}
-
-function snapshotQual(s) {
-  const bits = [];
-  if (s.plan) bits.push(`plan: ${s.plan}`);
-  if (s.location) bits.push(`loc: ${s.location}`);
-  if (s.body) bits.push(`body: ${s.body}`);
-  if (s.trans) bits.push(`trans: ${s.trans}`);
-  if (s.budget) bits.push(`budget: ${s.budget}`);
-  return bits.join(', ');
-}
-
-async function offerMatches(psid, s) {
-  const inv = await fetchInventory(INVENTORY_URL);
-  const input = {
-    plan: s.plan,
-    location: s.location,
-    body: s.body,
-    trans: s.trans,
-    budget: s.budget,
-    modelHint: s.modelHint
-  };
-
-  const { items, usedPriority } = matchTopTwo(inv.items || [], input);
-  if (!items || items.length === 0) { await talk(psid, COPY.nothingFound); return; }
-  if (!usedPriority) await talk(psid, COPY.proceedNonPriority);
-
-  await talk(psid, COPY.offerIntro);
-  s.offer = items.map(parseInventoryItem);
-
-  for (let i = 0; i < s.offer.length; i++) {
-    const it = s.offer[i];
-    if (it.image_1) await sendImage(psid, it.image_1);
-
-    const title = prettyTitle(it);
-    const allInNumber = Number(it.all_in || it.price_all_in || it['all-in'] || 0);
-    const allInText = isFinite(allInNumber) && allInNumber > 0
-      ? '₱' + allInNumber.toLocaleString('en-PH')
-      : (it.srp ? '₱' + Number(it.srp).toLocaleString('en-PH') : '—');
-
-    const locBits = [it.city, it.province].filter(Boolean).join(', ');
-    const mileageText = (it.mileage && isFinite(Number(it.mileage)))
-      ? ' — ' + Number(it.mileage).toLocaleString('en-PH') + ' km'
-      : '';
-
-    const caption = `#${i + 1} ${title}\nAll-in: ${allInText}\n${locBits}${mileageText}`;
-    await talk(psid, caption);
+  let idx = 0;
+  for (const u of units) {
+    idx++;
+    if (u.image_1) await sendImage(PAGE_TOKEN, psid, u.image_1);
+    await sendText(PAGE_TOKEN, psid, smartShort(unitTitle(u)));
   }
 
-  await talk(psid, COPY.whichPick);
-  await talk(psid, COPY.galleryHint);
+  await sendText(
+    PAGE_TOKEN,
+    psid,
+    smartShort("Anong number ang gusto mong tingnan? Sabihin mo: '1' o '2'.")
+  );
 }
 
-async function sendFullGallery(psid, item) {
+// Optional: gallery handler (ask user to say “photos 1/2”)
+async function maybeGallery(psid, msg, session) {
+  const m = msg.match(/\bphotos?\s*(1|2)\b/);
+  if (!m) return false;
+  const pick = Number(m[1]) - 1;
+  const units = await findBestUnits(session);
+  if (!units[pick]) return false;
+  const u = units[pick];
   const imgs = [
-    item.image_1, item.image_2, item.image_3, item.image_4, item.image_5,
-    item.image_6, item.image_7, item.image_8, item.image_9, item.image_10
-  ].filter(Boolean).slice(0, 10);
+    u.image_1,u.image_2,u.image_3,u.image_4,u.image_5,
+    u.image_6,u.image_7,u.image_8,u.image_9,u.image_10
+  ].filter(Boolean).slice(0,10);
 
+  await sendText(PAGE_TOKEN, psid, smartShort("Sige, here are more photos:"));
   for (const url of imgs) {
-    await sendImage(psid, url);
+    await sendImage(PAGE_TOKEN, psid, url);
   }
+  return true;
 }
