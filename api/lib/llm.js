@@ -289,3 +289,24 @@ export const NLP = {
   itemTitle,
   shortDetail
 };
+
+/** --------------------------------
+ *  Conversational prompts (ask)
+ *  -------------------------------- */
+export function ask(slotKey, { returning = false, name = '' } = {}) {
+  const h = humanizeOpt({ returning, name });
+  switch (slotKey) {
+    case 'greet':         return h.greet;
+    case 'plan':          return h.askPlan;
+    case 'location':      return h.askLocation;
+    case 'body_type':     return h.askBody;
+    case 'transmission':  return h.askTransmission;
+    case 'budget_cash':   return h.askBudgetCash;
+    default:              return '';
+  }
+}
+
+/** Namespace style export for backward compatibility:
+ *   import * as L from './lib/llm.js';  L.ask(...)
+ */
+export const L = { ask };
