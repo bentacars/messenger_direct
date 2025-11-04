@@ -1,4 +1,4 @@
-import { ToneB } from './tone/pack.B.js';
+import ToneB from './tone/pack.B.js';
 
 export const P = {
   greetNew: ToneB.greetNew,
