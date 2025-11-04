@@ -1,8 +1,18 @@
 {
-  "crons": [
-    {
-      "path": "/api/nudge",
-      "schedule": "*/5 * * * *"
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "api/**/*.js": {
+      "runtime": "nodejs"
     }
+  },
+  "routes": [
+    { "src": "^/api/webhook$", "dest": "/api/webhook.js" },
+    { "src": "^/api/nudge$",   "dest": "/api/nudge.js" }
+  ],
+
+  /* Cron runs every 15 minutes (UTC). 
+     Our code handles Manila quiet hours + cadence. */
+  "crons": [
+    { "path": "/api/nudge", "schedule": "*/15 * * * *" }
   ]
 }
