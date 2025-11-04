@@ -1,66 +1,80 @@
-// api/lib/messenger.js
+// api/lib/messenger.js (ESM)
+const FB_API = 'https://graph.facebook.com/v17.0/me/messages';
 
-const PAGE_TOKEN = process.env.FB_PAGE_TOKEN;
-const FB_API = 'https://graph.facebook.com/v18.0/me/messages';
-
-// --- utils ---
-function isPsid(v) { return typeof v === 'string' && /^\d{6,}$/.test(v); }
-
-function normalizePsidFirst(a, b) {
-  // expected: (psid, payload/text)
-  if (isPsid(a)) return [a, b];
-  if (isPsid(b)) return [b, a]; // tolerate reversed args
-  // last resort: throw with clear message
-  throw new Error(`Invalid PSID: "${a}"`);
+function getToken() {
+  const t = process.env.FB_PAGE_TOKEN;
+  if (!t) throw new Error('Missing FB_PAGE_TOKEN');
+  return t;
 }
 
-async function fbSend(payload) {
-  const url = `${FB_API}?access_token=${encodeURIComponent(PAGE_TOKEN)}`;
+function isValidPsid(v) {
+  // FB PSIDs are numeric strings
+  return typeof v === 'string' && /^[0-9]{5,}$/.test(v);
+}
+
+export function validatePsid(psid) {
+  if (!isValidPsid(psid)) {
+    throw new Error(`Invalid PSID: "${psid}"`);
+  }
+  return psid;
+}
+
+async function callSendAPI(payload) {
+  const token = getToken();
+  const url = `${FB_API}?access_token=${encodeURIComponent(token)}`;
   const res = await fetch(url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(payload),
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
   });
+  const j = await res.json().catch(() => ({}));
   if (!res.ok) {
-    const t = await res.text().catch(() => '');
-    throw new Error(`FB send error ${res.status} ${t}`);
+    throw new Error(`FB send error ${res.status} ${JSON.stringify(j)}`);
   }
+  return j;
 }
 
-// --- exports ---
 export async function sendTypingOn(psid) {
-  const [id] = normalizePsidFirst(psid, 'x');
-  await fbSend({
-    recipient: { id },
-    sender_action: 'typing_on',
-  });
+  validatePsid(psid);
+  return callSendAPI({ recipient: { id: psid }, sender_action: 'typing_on' });
 }
-
 export async function sendTypingOff(psid) {
-  const [id] = normalizePsidFirst(psid, 'x');
-  await fbSend({
-    recipient: { id },
-    sender_action: 'typing_off',
-  });
+  validatePsid(psid);
+  return callSendAPI({ recipient: { id: psid }, sender_action: 'typing_off' });
 }
 
 export async function sendText(psid, text) {
-  const [id, msg] = normalizePsidFirst(psid, text);
-  await fbSend({
-    recipient: { id },
-    message: { text: String(msg).slice(0, 2000) }, // guard length
+  validatePsid(psid);
+  return callSendAPI({
+    recipient: { id: psid },
+    message: { text }
   });
 }
 
 export async function sendImage(psid, url) {
-  const [id, u] = normalizePsidFirst(psid, url);
-  await fbSend({
-    recipient: { id },
+  validatePsid(psid);
+  return callSendAPI({
+    recipient: { id: psid },
     message: {
       attachment: {
         type: 'image',
-        payload: { url: u, is_reusable: false },
-      },
-    },
+        payload: { url, is_reusable: false }
+      }
+    }
+  });
+}
+
+export async function sendQuickReplies(psid, text, replies) {
+  validatePsid(psid);
+  return callSendAPI({
+    recipient: { id: psid },
+    message: {
+      text,
+      quick_replies: replies.map(r => ({
+        content_type: 'text',
+        title: r.title?.slice(0, 20) || r.payload,
+        payload: r.payload
+      }))
+    }
   });
 }
