@@ -1,17 +1,64 @@
 // api/webhook.js
 import { sendText, sendImage } from './lib/messenger.js';
-import { humanizeOpt, detectName } from './lib/llm.js';
 import { matchTopTwo, parseInventoryItem, fetchInventory } from './lib/matching.js';
 
 const VERIFY_TOKEN = process.env.FB_VERIFY_TOKEN;
 const INVENTORY_URL = process.env.INVENTORY_API_URL;
 const ENABLE_TONE = (process.env.ENABLE_TONE_LLM || '0') === '1';
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.OPENAT_API_KEY;
+const MODEL_DEFAULT = process.env.MODEL_DEFAULT || 'gpt-4.1';
+const TEMP_DEFAULT = Number(process.env.TEMP_DEFAULT ?? 0.30);
 
-// -------- In-memory session --------
+// ---------- Optional tone rewriter (Taglish, friendly, expert) ----------
+async function maybeHumanize(text) {
+  if (!ENABLE_TONE || !OPENAI_API_KEY) return text;
+  try {
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: MODEL_DEFAULT,
+        temperature: TEMP_DEFAULT,
+        messages: [
+          {
+            role: 'system',
+            content:
+              "You are a warm, human-sounding Filipino car sales consultant (Taglish). " +
+              "Be short, friendly, and expert. Build light rapport but keep it efficient. " +
+              "Avoid robotic phrasing and avoid emoji spam (0–1 emoji max). " +
+              "No quick-reply buttons or lists—sound like a real person."
+          },
+          { role: 'user', content: text }
+        ]
+      })
+    });
+    const data = await res.json();
+    return (data.choices?.[0]?.message?.content || text).trim();
+  } catch {
+    return text;
+  }
+}
+async function talk(psid, text) { await sendText(psid, await maybeHumanize(text)); }
+
+// ---------- Minimal name sniff (safe if profile absent) ----------
+function detectName(event) {
+  try {
+    const prof =
+      event?.sender?.profile ||
+      event?.message?.nlp?.entities?.profile?.[0] ||
+      event?.context?.user_profile ||
+      null;
+    const full = prof?.name || prof?.first_name || null;
+    if (!full) return null;
+    const first = String(full).trim().split(/\s+/)[0];
+    return first ? first.charAt(0).toUpperCase() + first.slice(1).toLowerCase() : null;
+  } catch { return null; }
+}
+
+// ---------- Ephemeral in-memory session ----------
 const SESSIONS = new Map();
 const TTL_MS = (parseInt(process.env.MEMORY_TTL_DAYS || '7', 10)) * 24 * 60 * 60 * 1000;
 const now = () => Date.now();
-
 function getSession(psid) {
   const s = SESSIONS.get(psid);
   if (!s) return null;
@@ -20,14 +67,14 @@ function getSession(psid) {
 }
 function ensureSession(psid) {
   const s = getSession(psid) || {
-    phase: 'start',
-    plan: null,
+    phase: 'start',    // start -> plan -> location -> body -> trans -> budget -> ready
+    plan: null,        // 'cash' | 'financing'
     location: null,
-    body: null,
-    trans: null,
-    budget: null,
-    modelHint: null,
-    offer: null,
+    body: null,        // sedan/suv/mpv/van/pickup/any
+    trans: null,       // automatic/manual/any
+    budget: null,      // text range
+    modelHint: null,   // optional ("vios", etc.)
+    offer: null,       // last offered 2 items
     name: null
   };
   s.updatedAt = now();
@@ -36,50 +83,56 @@ function ensureSession(psid) {
 }
 function resetSession(psid) { SESSIONS.delete(psid); }
 
-// -------- Helpers --------
-async function talk(psid, text) {
-  const out = ENABLE_TONE ? await humanizeOpt(text) : text;
-  await sendText(psid, out);
-}
-const normalize = (t='') => t.trim().toLowerCase();
-const isRestart = (t) => /^(restart|start over|reset)$/.test(normalize(t));
-const sniffModelHint = (t='') => {
-  const m = t.match(/\b(vios|mirage|city|accent|fortuner|innova|xtrail|civic|corolla|nv350|hiace|raize|br-v|xle|glx|gls|e|g|vx)\b/i);
+// ---------- Text helpers ----------
+const normalize = (t = '') => t.trim().toLowerCase();
+const isRestart = (t) => /^(restart|start over|reset|ulit tayo|bagong search|new inquiry)$/.test(normalize(t));
+function parsePlan(t) { const s = normalize(t); if (/\bcash\b/.test(s)) return 'cash'; if (/financ/.test(s)) return 'financing'; return null; }
+function parseBody(t) { const s = normalize(t); if (/\bsedan\b/.test(s)) return 'sedan'; if (/\bsuv\b/.test(s)) return 'suv'; if (/\bmpv\b/.test(s)) return 'mpv'; if (/\bvan\b/.test(s)) return 'van'; if (/\bpick(?: ?up)?\b/.test(s)) return 'pickup'; if (/\bany\b/.test(s)) return 'any'; return null; }
+function parseTrans(t){ const s = normalize(t); if (/auto/.test(s)) return 'automatic'; if (/manu/.test(s)) return 'manual'; if (/\bany\b/.test(s)) return 'any'; return null; }
+function parsePick(t) { const s = normalize(t); const m = s.match(/\b([12])\b/); return m ? parseInt(m[1], 10) : null; }
+function validText(t) { return t && t.trim().length >= 2; }
+function sniffModelHint(t = '') {
+  const m = t.match(/\b(vios|mirage|city|accent|fortuner|innova|xtrail|civic|corolla|nv350|hiace|raize|br-v|livina|terra|urvan)\b/i);
   return m ? m[0] : null;
-};
+}
+function prettyTitle(item) {
+  const year = item.year ? String(item.year) : '';
+  const brand = item.brand || '';
+  const model = item.model || '';
+  const variant = item.variant ? (' ' + item.variant) : '';
+  return `${year} ${brand} ${model}${variant}`.trim();
+}
 
-// -------- Copy --------
+// ---------- Copy (human-friendly) ----------
 const COPY = {
   welcomeNew: (name) =>
-`Hi${name ? ' ' + name : ''}! 👋 I’m your BentaCars consultant.
-Tulungan kita maghanap ng **best match** para di ka na endless scroll. 🙂
-Quick lang — cash ba o financing ang plan mo?`,
+    `Hi${name ? ' ' + name : ''}! 👋 I’m your BentaCars consultant. ` +
+    `Tutulungan kitang ma-match sa best unit para hindi ka na endless scroll. ` +
+    `Quick lang — cash payment ka ba or financing plan?`,
   welcomeBack: (snap) =>
-`Welcome back! 👋 Last time, napag-usapan natin: **${snap}**.
-Gusto mo bang ituloy yun, or type **restart** para magsimula ulit?`,
+    `Welcome back! 👋 Last time, noted ko ito: ${snap}. ` +
+    `Gusto mo bang ituloy yan, or type **restart** para magsimula ulit?`,
   askPlan: `Para ma-match ka nang maayos, cash ba o financing ang plan mo? 🙂`,
-  ackPlan: (p) => `Got it — **${p}** ✅`,
+  ackPlan: (p) => `Got it — ${p.toUpperCase()} ✅`,
   askLocation: `Saan ka base para madaling tingnan ang malapit na units? (city/province)`,
-  ackLocation: (loc) => `Sige, **${loc}**. Marami tayong ma-check diyan. ✅`,
-  askBody: `Anong type ang gusto mo? *Sedan, SUV, MPV, Van, Pickup* — or **any** kung flexible ka.`,
-  ackBody: (b) => `Copy — **${b}** type. ✅`,
-  askTrans: `Transmission? *Automatic* o *Manual* — pwede ring **any**.`,
-  ackTrans: (t) => `Noted — **${t}**. ✅`,
-  askBudgetCash: `Last na: mga magkano ang **cash budget** mo? (e.g., ₱450k–₱600k)`,
-  askBudgetFin: `Last na: mga magkano ang **ready cash-out / all-in** range mo? (e.g., 150k–220k)`,
+  ackLocation: (loc) => `Sige, ${loc}. Marami tayong ma-check diyan. ✅`,
+  askBody: `Anong type ang gusto mo? Sedan, SUV, MPV, Van, Pickup — or **any** kung flexible ka.`,
+  ackBody: (b) => `Copy — ${b} type. ✅`,
+  askTrans: `Transmission? Automatic o Manual — pwede ring **any**.`,
+  ackTrans: (t) => `Noted — ${t}. ✅`,
+  askBudgetCash: `Last na: mga magkano ang **cash budget** mo? (hal. ₱450k–₱600k)`,
+  askBudgetFin: `Last na: mga magkano ang **ready cash-out / all-in** range mo? (hal. 150k–220k)`,
   ackBudget: `Salamat! ✅ Sapat na yan para ma-filter ko nang ayos.`,
-  searching: `Sige, i-scan ko na ang inventory para sa pinaka-swak na dalawa (priority muna).`,
-  noExactButExpand: `Walang exact sa strict filters. Okay lang bang i-relax ko nang kaunti para may maipakita agad?`,
-  offerIntro: `Ito yung pinaka-swak sa details mo *(priority muna)*:`,
-  whichPick: `Alin ang mas gusto mo, **#1** o **#2**? Pwede ring sabihin mo ang model name.`,
-  galleryHint: `Sabihin mo lang **“more photos”** o **“full photos of #1/#2”** para isend ko lahat ng pics.`,
-  nothingFound: `Wala pa rin akong makita na pasok. Pwede tayong mag-adjust ng **budget** or **nearby cities** para magka-options agad.`,
-  proceedNonPriority: `Walang Priority tag sa filters mo, so nag-proceed ako sa best matches na available.`,
-  afterPick: (title) => `Great choice! **${title}**. Isesend ko ang full photos — then pwede na rin tayong mag-schedule ng viewing.`,
-  scheduled: `Noted. Iche-check ko ang schedule options and ibabalik ko sayo.`
+  searching: `Sige, i-scan ko na ang inventory para sa pinaka-swak na dalawa (priority muna kung meron).`,
+  offerIntro: `Ito yung pinaka-swak sa details mo (Priority muna kung available):`,
+  proceedNonPriority: `Walang Priority sa filter mo, kaya nag-proceed ako sa best matches na available.`,
+  whichPick: `Alin ang mas gusto mo, #1 o #2? Pwede mo rin sabihin ang model name.`,
+  galleryHint: `Gusto mo ng full photos? Sabihin mo: “more photos” o “full photos of #1/#2”.`,
+  nothingFound: `Walang pasok sa sobrang higpit ng filter. Okay bang i-relax natin ng kaunti (budget o nearby cities) para may maipakita agad?`,
+  afterPick: (title) => `Great choice! ${title}. Isesend ko ang full photos — then pwede na tayong mag-schedule ng viewing.`
 };
 
-// -------- Webhook --------
+// ---------- Public webhook ----------
 export default async function handler(req, res) {
   try {
     if (req.method === 'GET') {
@@ -89,10 +142,9 @@ export default async function handler(req, res) {
       if (mode === 'subscribe' && token === VERIFY_TOKEN) return res.status(200).send(challenge);
       return res.status(403).send('Forbidden');
     }
-
     if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
-    // Body parsing (Vercel usually provides req.body already)
+    // Vercel usually gives req.body; if not, try json()
     let body = req.body;
     if (!body || (typeof body === 'string' && !body.length)) {
       try { body = await req.json(); } catch { body = null; }
@@ -101,17 +153,16 @@ export default async function handler(req, res) {
 
     for (const entry of body.entry || []) {
       for (const event of entry.messaging || []) {
-        const senderId = event.sender && event.sender.id;
-        if (!senderId) continue;
+        const psid = event?.sender?.id;
+        if (!psid) continue;
 
-        if (event.message && event.message.text) {
-          await handleText(senderId, event.message.text, event);
-        } else if (event.postback && event.postback.payload) {
-          await handleText(senderId, event.postback.payload, event);
+        if (event.message?.text) {
+          await onText(psid, event.message.text, event);
+        } else if (event.postback?.payload) {
+          await onText(psid, event.postback.payload, event);
         }
       }
     }
-
     return res.status(200).json({ ok: true });
   } catch (e) {
     console.error('webhook error', e);
@@ -119,12 +170,13 @@ export default async function handler(req, res) {
   }
 }
 
-// -------- Conversation engine --------
-async function handleText(psid, rawText, event) {
+// ---------- Conversation engine ----------
+async function onText(psid, rawText, event) {
   const text = rawText || '';
   const s = ensureSession(psid);
   if (!s.name) s.name = detectName(event) || null;
 
+  // Restart
   if (isRestart(text)) {
     resetSession(psid);
     const ns = ensureSession(psid);
@@ -133,16 +185,23 @@ async function handleText(psid, rawText, event) {
     return;
   }
 
+  // Model hint anytime
   const mh = sniffModelHint(text);
   if (mh) s.modelHint = mh;
 
+  // Greet
   if (s.phase === 'start') {
     const snap = snapshotQual(s);
-    if (snap) await talk(psid, COPY.welcomeBack(snap));
-    else { await talk(psid, COPY.welcomeNew(s.name)); s.phase = 'plan'; }
+    if (snap) {
+      await talk(psid, COPY.welcomeBack(snap));
+    } else {
+      await talk(psid, COPY.welcomeNew(s.name));
+      s.phase = 'plan';
+    }
     return;
   }
 
+  // FSM
   switch (s.phase) {
     case 'plan': {
       const plan = parsePlan(text);
@@ -175,13 +234,15 @@ async function handleText(psid, rawText, event) {
       if (!t) { await talk(psid, COPY.askTrans); return; }
       s.trans = t;
       await talk(psid, COPY.ackTrans(t));
-      await talk(psid, s.plan === 'cash' ? COPY.askBudgetCash : COPY.askBudgetFin);
+      if (s.plan === 'cash') await talk(psid, COPY.askBudgetCash);
+      else await talk(psid, COPY.askBudgetFin);
       s.phase = 'budget';
       return;
     }
     case 'budget': {
       if (!validText(text)) {
-        await talk(psid, s.plan === 'cash' ? COPY.askBudgetCash : COPY.askBudgetFin);
+        if (s.plan === 'cash') await talk(psid, COPY.askBudgetCash);
+        else await talk(psid, COPY.askBudgetFin);
         return;
       }
       s.budget = text.trim();
@@ -192,6 +253,7 @@ async function handleText(psid, rawText, event) {
       return;
     }
     case 'ready': {
+      // Picks and gallery
       const pick = parsePick(text);
       if (pick) {
         const chosen = s.offer?.[pick - 1];
@@ -205,13 +267,16 @@ async function handleText(psid, rawText, event) {
         const chosen = s.offer?.[0];
         if (chosen) { await sendFullGallery(psid, chosen); return; }
       }
+      // Model pivot
       if (mh) {
         s.modelHint = mh;
-        await talk(psid, `Sige, titingnan ko ang options for **${mh}**.`);
+        await talk(psid, `Sige, titingnan ko ang options for ${mh}.`);
         await offerMatches(psid, s);
         return;
       }
-      await talk(psid, `Kung may ibang target model ka, sabihin mo lang (hal. “Vios” o “NV350”). Kapag gusto mo ng ibang options, sabihin mo “hanap ulit”.`);
+      // Nudge
+      await talk(psid, `Kung may ibang target model ka, sabihin mo lang (hal. “Vios” o “NV350”). ` +
+                       `Kapag gusto mo ng ibang options, sabihin mo “hanap ulit”.`);
       return;
     }
     default:
@@ -230,39 +295,6 @@ function snapshotQual(s) {
   return bits.join(', ');
 }
 
-function parsePlan(t) {
-  const s = normalize(t);
-  if (/\bcash\b/i.test(s)) return 'cash';
-  if (/financ/i.test(s)) return 'financing';
-  return null;
-}
-function parseBody(t) {
-  const s = normalize(t);
-  if (/\bsedan\b/.test(s)) return 'sedan';
-  if (/\bsuv\b/.test(s)) return 'suv';
-  if (/\bmpv\b/.test(s)) return 'mpv';
-  if (/\bvan\b/.test(s)) return 'van';
-  if (/\bpick(?:up)?\b/.test(s)) return 'pickup';
-  if (/\bany\b/.test(s)) return 'any';
-  return null;
-}
-function parseTrans(t) {
-  const s = normalize(t);
-  if (/auto/.test(s)) return 'automatic';
-  if (/manu/.test(s)) return 'manual';
-  if (/\bany\b/.test(s)) return 'any';
-  return null;
-}
-function parsePick(t) {
-  const s = normalize(t);
-  const m = s.match(/\b([12])\b/);
-  return m ? parseInt(m[1], 10) : null;
-}
-function validText(t) { return t && t.trim().length >= 2; }
-function prettyTitle(item) {
-  return `${item.year} ${item.brand} ${item.model}${item.variant ? ' ' + item.variant : ''}`.trim();
-}
-
 async function offerMatches(psid, s) {
   const inv = await fetchInventory(INVENTORY_URL);
   const input = {
@@ -273,6 +305,7 @@ async function offerMatches(psid, s) {
     budget: s.budget,
     modelHint: s.modelHint
   };
+
   const { items, usedPriority } = matchTopTwo(inv.items || [], input);
   if (!items || items.length === 0) { await talk(psid, COPY.nothingFound); return; }
   if (!usedPriority) await talk(psid, COPY.proceedNonPriority);
@@ -282,23 +315,20 @@ async function offerMatches(psid, s) {
 
   for (let i = 0; i < s.offer.length; i++) {
     const it = s.offer[i];
-    // image_1
     if (it.image_1) await sendImage(psid, it.image_1);
 
-    // Safe caption (no nested template strings)
     const title = prettyTitle(it);
-    const allInNumber = Number(it.all_in || it.price_all_in || 0);
+    const allInNumber = Number(it.all_in || it.price_all_in || it['all-in'] || 0);
     const allInText = isFinite(allInNumber) && allInNumber > 0
       ? '₱' + allInNumber.toLocaleString('en-PH')
-      : '—';
+      : (it.srp ? '₱' + Number(it.srp).toLocaleString('en-PH') : '—');
+
     const locBits = [it.city, it.province].filter(Boolean).join(', ');
     const mileageText = (it.mileage && isFinite(Number(it.mileage)))
       ? ' — ' + Number(it.mileage).toLocaleString('en-PH') + ' km'
       : '';
-    const caption = `#${i + 1} 🚗 **${title}**
-All-in: **${allInText}**
-${locBits}${mileageText}`;
 
+    const caption = `#${i + 1} ${title}\nAll-in: ${allInText}\n${locBits}${mileageText}`;
     await talk(psid, caption);
   }
 
