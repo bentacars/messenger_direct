@@ -3,8 +3,6 @@ import {
   sendText, sendTypingOn, sendTypingOff, sendImage, sendQuickReplies, validatePsid
 } from './lib/messenger.js';
 
-export const config = { runtime: 'nodejs18.x' };
-
 const VERIFY_TOKEN = process.env.FB_VERIFY_TOKEN;
 const INV_URL = process.env.INVENTORY_API_URL;
 
