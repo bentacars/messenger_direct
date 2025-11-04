@@ -1,65 +1,36 @@
 // api/webhook.js
-import {
-  sendText,
-  sendTypingOn,
-  sendTypingOff,
-  sendImage
-} from './lib/messenger.js';
-import {
-  adaptTone,
-  smartShort,
-  remember,
-  recall,
-  forgetIfRestart,
-  extractClues
-} from './lib/llm.js';
+import { sendText, sendTypingOn, sendTypingOff, sendImage } from './lib/messenger.js';
+import { adaptTone, smartShort, remember, recall, forgetIfRestart, extractClues } from './lib/llm.js';
 
 const VERIFY_TOKEN = process.env.FB_VERIFY_TOKEN;
 const PAGE_TOKEN = process.env.FB_PAGE_TOKEN;
 const INVENTORY_API_URL = process.env.INVENTORY_API_URL;
 
-// simple in-memory store (will reset on cold starts)
-const SESS = new Map();
+const SESS = new Map(); // ephemeral
 
 function getSession(psid) {
   if (!SESS.has(psid)) {
     SESS.set(psid, {
-      name: null,
       prefs: {
-        plan: null,       // "cash" | "financing"
-        city: null,
-        body: null,       // sedan/suv/mpv/van/pickup/any
-        trans: null,      // automatic/manual/any
-        budgetMin: null,  // cash
-        budgetMax: null,  // cash
-        dpMin: null,      // financing
-        dpMax: null,      // financing
-        model: null,
-        year: null
-      },
-      last: Date.now()
+        plan: null, city: null, body: null, trans: null,
+        budgetMin: null, budgetMax: null, dpMin: null, dpMax: null,
+        model: null, year: null
+      }
     });
   }
   return SESS.get(psid);
 }
+function normalize(s) { return (s || '').toString().trim().toLowerCase(); }
 
-function normalize(s) {
-  return (s || '').toString().trim().toLowerCase();
-}
-
-// ===== FB VERIFY (GET) =====
 export async function GET(req) {
   const { searchParams } = new URL(req.url);
   const mode = searchParams.get('hub.mode');
   const token = searchParams.get('hub.verify_token');
-  const chall = searchParams.get('hub.challenge');
-  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
-    return new Response(chall, { status: 200 });
-  }
+  const challenge = searchParams.get('hub.challenge');
+  if (mode === 'subscribe' && token === VERIFY_TOKEN) return new Response(challenge, { status: 200 });
   return new Response('forbidden', { status: 403 });
 }
 
-// ===== MAIN WEBHOOK (POST) =====
 export async function POST(req) {
   try {
     const body = await req.json();
@@ -67,14 +38,11 @@ export async function POST(req) {
 
     for (const entry of body.entry || []) {
       for (const ev of entry.messaging || []) {
-        const psid = ev.sender && ev.sender.id;
-        if (!psid) continue;
+        const psid = ev?.sender?.id;
+        if (!psid) { console.error('Missing PSID', ev); continue; }
 
-        if (ev.message && ev.message.text) {
-          await handleText(psid, ev.message.text);
-        } else if (ev.postback && ev.postback.payload) {
-          await handleText(psid, ev.postback.payload);
-        }
+        if (ev.message?.text) await handleText(psid, ev.message.text);
+        else if (ev.postback?.payload) await handleText(psid, ev.postback.payload);
       }
     }
     return new Response('ok', { status: 200 });
@@ -84,81 +52,58 @@ export async function POST(req) {
   }
 }
 
-// ===== CONVERSATION =====
+// ===== Conversation flow =====
 const ASK_ORDER = ['plan', 'city', 'body', 'trans', 'budget']; // budget last
 
 async function handleText(psid, raw) {
   const msg = normalize(raw);
   const session = getSession(psid);
 
-  // restart
   if (await forgetIfRestart(msg, psid, session)) {
-    await sendText(PAGE_TOKEN, psid, 'Sige, start tayo ulit.');
+    await sendText(PAGE_TOKEN, psid, 'Reset na. Let’s start fresh.');
     return askNext(psid, session, true);
   }
 
-  // quick gallery command
-  const didGallery = await maybeGallery(psid, msg, session);
-  if (didGallery) return;
-
-  // clues (model/year/body hints)
   extractClues(msg, session);
 
-  // greeting handling
   const wasSeen = !!recall(psid);
   remember(psid);
-  if (/^(hi|hello|hey|good\s*(am|pm|day)|kumusta|hoy)\b/.test(msg)) {
+  if (/^(hi|hello|hey|kumusta|good\s*(am|pm|day))\b/.test(msg)) {
     const line = wasSeen
-      ? 'Welcome back! Ready ka bang maghanap ng unit ngayon?'
-      : 'Hi! Tutulungan kitang ma-match sa best used car. 🙂';
-    await sendText(PAGE_TOKEN, psid, smartShort(adaptTone(line, msg)));
+      ? 'Welcome back! Ready maghanap ng unit?'
+      : 'Hi! I’ll match you to the best used car—mas mabilis kaysa endless scrolling.';
+    await sendText(PAGE_TOKEN, psid, smartShort(adaptTone(line, raw)));
     return askNext(psid, session, false);
   }
 
-  // capture current answer
-  await captureAnswer(psid, msg, session);
+  await captureAnswer(msg, session);
 
-  // qualified? then fetch and offer; else keep asking
   if (isQualified(session)) {
     await sendTypingOn(PAGE_TOKEN, psid);
     const units = await findBestUnits(session);
     await sendTypingOff(PAGE_TOKEN, psid);
 
     if (!units.length) {
-      await sendText(
-        PAGE_TOKEN,
-        psid,
-        smartShort(adaptTone('Walang exact priority match, pero may malalapit na options. Ipapadala ko ang unang dalawa.', raw))
-      );
+      await sendText(PAGE_TOKEN, psid, smartShort('Walang exact priority match, pero may malalapit na options. Ipapakita ko ang top 2.'));
     }
-
     await offerTopTwo(psid, units, session);
-    await sendText(
-      PAGE_TOKEN,
-      psid,
-      smartShort('Sabihin mo lang: "photos 1" o "photos 2" para sa full gallery. Pwede ring "iba pa" para sa alternatives.')
-    );
+    await sendText(PAGE_TOKEN, psid, smartShort('Gusto mo ng full photos? Sabihin mo: "photos 1" o "photos 2".'));
   } else {
     await askNext(psid, session, false);
   }
 }
 
-async function captureAnswer(psid, msg, session) {
+async function captureAnswer(msg, session) {
   const p = session.prefs;
 
-  // plan
   if (!p.plan) {
     if (/\b(cash|spot\s*cash|cash\s*buyer)\b/.test(msg)) p.plan = 'cash';
     if (/\b(finance|financing|loan|installment|hulog)\b/.test(msg)) p.plan = 'financing';
   }
-
-  // city
   if (!p.city) {
     const m = msg.match(/\b(qc|quezon city|manila|makati|pasig|pasay|mandaluyong|taguig|caloocan|valenzuela|marikina|muntinlupa|paranaque|las pinas|cebu|davao|iloilo|bacolod|pampanga|cavite|bulacan)\b/);
     if (m) p.city = m[0];
   }
-
-  // body
   if (!p.body) {
     const bodyKeys = ['sedan','suv','mpv','van','pickup','pick-up','pick up','any'];
     const found = bodyKeys.find(k => msg.includes(k));
@@ -167,20 +112,15 @@ async function captureAnswer(psid, msg, session) {
     if (!p.body && /vios|city|mirage|altis|elantra|accent\b/.test(msg)) p.body = 'sedan';
     if (!p.body && /fortuner|everest|montero|terra|raize|cx-5|cr-v|ranger|hilux|strada|navara\b/.test(msg)) p.body = 'suv';
   }
-
-  // transmission
   if (!p.trans) {
     if (/\b(automatic|at|a\/t)\b/.test(msg)) p.trans = 'automatic';
     if (/\b(manual|mt|m\/t|stick)\b/.test(msg)) p.trans = 'manual';
     if (/\bany\b/.test(msg)) p.trans = 'any';
   }
-
-  // budget text to numbers
   if (!hasBudget(p)) {
     const range = msg.match(/(\d{2,3})\s*(?:-|–|to)\s*(\d{2,3})\s*k/i);
     if (range) {
-      const a = Number(range[1]) * 1000;
-      const b = Number(range[2]) * 1000;
+      const a = Number(range[1]) * 1000, b = Number(range[2]) * 1000;
       if (p.plan === 'cash') { p.budgetMin = Math.min(a,b); p.budgetMax = Math.max(a,b); }
       else { p.dpMin = Math.min(a,b); p.dpMax = Math.max(a,b); }
     }
@@ -198,7 +138,6 @@ function hasBudget(p) {
     ? (p.budgetMin != null || p.budgetMax != null)
     : (p.dpMin != null || p.dpMax != null);
 }
-
 function isQualified(session) {
   const p = session.prefs;
   return !!(p.plan && p.city && p.body && p.trans && hasBudget(p));
@@ -206,28 +145,15 @@ function isQualified(session) {
 
 async function askNext(psid, session, welcome) {
   const p = session.prefs;
+  if (welcome) await sendText(PAGE_TOKEN, psid, smartShort('Let’s get the basics para tama ang match.'));
 
-  if (welcome) {
-    await sendText(PAGE_TOKEN, psid, smartShort('Let us match you to the best used car.'));
-  }
-  if (!p.plan) {
-    return sendText(PAGE_TOKEN, psid, smartShort('Cash or financing ang plan mo?'));
-  }
-  if (!p.city) {
-    return sendText(PAGE_TOKEN, psid, smartShort('Saan location mo? (city/province)'));
-  }
-  if (!p.body) {
-    return sendText(PAGE_TOKEN, psid, smartShort('Preferred body type? (sedan/suv/mpv/van/pickup or "any")'));
-  }
-  if (!p.trans) {
-    return sendText(PAGE_TOKEN, psid, smartShort('Transmission? (automatic / manual or "any")'));
-  }
+  if (!p.plan) return sendText(PAGE_TOKEN, psid, smartShort('Cash or financing ang plan mo?'));
+  if (!p.city) return sendText(PAGE_TOKEN, psid, smartShort('Saan location mo? (city/province)'));
+  if (!p.body) return sendText(PAGE_TOKEN, psid, smartShort('Preferred body type? (sedan/suv/mpv/van/pickup or "any")'));
+  if (!p.trans) return sendText(PAGE_TOKEN, psid, smartShort('Transmission? (automatic / manual or "any")'));
   if (!hasBudget(p)) {
-    if (p.plan === 'cash') {
-      return sendText(PAGE_TOKEN, psid, smartShort('Cash budget range? (e.g., 450k-600k or "below 600k")'));
-    } else {
-      return sendText(PAGE_TOKEN, psid, smartShort('Ready cash-out / all-in range? (e.g., 150k-220k)'));
-    }
+    if (p.plan === 'cash') return sendText(PAGE_TOKEN, psid, smartShort('Cash budget range? (e.g., 450k-600k or "below 600k")'));
+    return sendText(PAGE_TOKEN, psid, smartShort('Ready cash-out / all-in range? (e.g., 150k-220k)'));
   }
 }
 
@@ -295,9 +221,9 @@ function unitTitle(u) {
   return '🚗 ' + name + '\n' + priceText + '\n' + city + (km ? (' — ' + km) : '');
 }
 
-async function offerTopTwo(psid, units, session) {
+async function offerTopTwo(psid, units) {
   if (!units.length) {
-    await sendText(PAGE_TOKEN, psid, smartShort('Maghahanap pa ako ng lalabas na units sa budget mo. Pwede nating i-adjust ang filters mo.'));
+    await sendText(PAGE_TOKEN, psid, smartShort('Sige, maghahanap pa ako ng options na pasok sa filters mo.'));
     return;
   }
   const note = /priority/i.test(units[0]?.price_status || '')
@@ -311,26 +237,5 @@ async function offerTopTwo(psid, units, session) {
     if (u.image_1) await sendImage(PAGE_TOKEN, psid, u.image_1);
     await sendText(PAGE_TOKEN, psid, smartShort(unitTitle(u)));
   }
-
-  await sendText(PAGE_TOKEN, psid, smartShort('Anong number ang gusto mong tingnan? Sabihin mo: "1" o "2".'));
-}
-
-async function maybeGallery(psid, msg, session) {
-  const m = msg.match(/\bphotos?\s*(1|2)\b/);
-  if (!m) return false;
-  const index = Number(m[1]) - 1;
-  const units = await findBestUnits(session);
-  if (!units[index]) return false;
-  const u = units[index];
-
-  const imgs = [
-    u.image_1, u.image_2, u.image_3, u.image_4, u.image_5,
-    u.image_6, u.image_7, u.image_8, u.image_9, u.image_10
-  ].filter(Boolean).slice(0, 10);
-
-  await sendText(PAGE_TOKEN, psid, smartShort('Sige, here are more photos:'));
-  for (const url of imgs) {
-    await sendImage(PAGE_TOKEN, psid, url);
-  }
-  return true;
+  await sendText(PAGE_TOKEN, psid, smartShort('Sabihin mo "1" or "2" kung alin ang gusto mong i-view, o "photos 1/2" for full gallery.'));
 }
