@@ -1,32 +1,74 @@
 // api/lib/llm.js
-const MEMORY = new Map(); // psid -> { lastSeen }
+// Lightweight “human” phrasing + utilities (no long system prompts)
 
-export function remember(psid) { MEMORY.set(psid, { lastSeen: Date.now() }); }
-export function recall(psid) { return MEMORY.get(psid); }
-
-export async function forgetIfRestart(msg, psid, session) {
-  if (!/^(restart|start over|reset)$/i.test(msg)) return false;
-  session.prefs = {
-    plan: null, city: null, body: null, trans: null,
-    budgetMin: null, budgetMax: null, dpMin: null, dpMax: null,
-    model: null, year: null
-  };
-  return true;
+export function greet(sess) {
+  // First-time vs returning
+  if (!sess?.data?.plan && !sess?.data?.city) {
+    return "Hi! 👋 I’m your BentaCars consultant. Tutulungan kitang ma-match sa best unit para di ka na mag-scroll nang mag-scroll.";
+  }
+  return "Hi again! Ready na ko to continue kung saan tayo huli.";
 }
 
-export function adaptTone(text, userMsg) {
-  if (/\b(pare|bro|tol|hehe|lol)\b/i.test(userMsg)) return text.replace(/\bpo\b/gi, '');
-  return text;
-}
-export function smartShort(text) {
-  const parts = String(text).split(/(?<=[.!?])\s+/).filter(Boolean);
-  const take = parts.slice(0, 2).join(' ');
-  return take.length ? take : text;
+export function shouldReset(textLower) {
+  return /\b(restart|reset|start over|ulit tayo)\b/i.test(textLower);
 }
 
-export function extractClues(msg, session) {
-  const mdl = msg.match(/\b(vios|mirage|city|altis|civic|fortuner|everest|montero|terra|nv350|urvan|hiace|starex|innova|raize|livina|traviz|ranger|hilux|strada|navara)\b/i);
-  if (mdl) session.prefs.model = mdl[1].toLowerCase();
-  const yr = msg.match(/\b(20(1[4-9]|2[0-6]))\b/);
-  if (yr) session.prefs.year = Number(yr[1]);
+export function smartReply(tag) {
+  switch (tag) {
+    case 'plan_retry':
+      return "Cash or financing? Para ma-filter ko agad nang tama.";
+    default:
+      return "Sige.";
+  }
+}
+
+// Detect model by scanning inventory list; returns model slug (lowercase) if found in user text
+export function detectModelFromText(userText, inventoryList) {
+  const low = (userText || '').toLowerCase();
+  if (!low) return '';
+  // Build a small set of unique model tokens from inventory (e.g., 'vios', 'mirage', 'nv350')
+  const uniq = new Set();
+  for (const it of inventoryList || []) {
+    const m = (it.model || '').toLowerCase().trim();
+    if (m) uniq.add(m);
+  }
+  for (const m of uniq) {
+    const re = new RegExp(`\\b${escapeRegex(m)}\\b`, 'i');
+    if (re.test(low)) return m;
+  }
+  return '';
+}
+
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// “450k-600k”, “150000-220000”, “below 600k”, “under 500k”, “200k to 250k”
+export function normalizeBudget(text) {
+  const t = (text || '').toLowerCase().replace(/,/g, '').replace(/\s+/g, ' ').trim();
+
+  // below/under X
+  let m = t.match(/\b(below|under)\s+(\d+\.?\d*)(k)?\b/);
+  if (m) {
+    const num = Number(m[2]) * (m[3] ? 1000 : 1);
+    return { min: 0, max: num };
+  }
+
+  // X - Y or X to Y
+  m = t.match(/(\d+\.?\d*)(k)?\s*(?:\-|to|–|—)\s*(\d+\.?\d*)(k)?/);
+  if (m) {
+    const a = Number(m[1]) * (m[2] ? 1000 : 1);
+    const b = Number(m[3]) * (m[4] ? 1000 : 1);
+    const min = Math.min(a, b);
+    const max = Math.max(a, b);
+    return { min, max };
+  }
+
+  // single number → treat as max
+  m = t.match(/(\d+\.?\d*)(k)?/);
+  if (m) {
+    const v = Number(m[1]) * (m[2] ? 1000 : 1);
+    return { min: 0, max: v };
+  }
+  return null;
 }
