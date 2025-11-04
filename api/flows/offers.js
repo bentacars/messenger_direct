@@ -1,14 +1,16 @@
+// api/flows/offers.js
 import { fetchInventory } from '../lib/inventory.js';
 import { rank } from '../lib/matcher.js';
 import { imageList } from '../lib/photos.js';
 import { cashLine, financingLine, monthlyLines } from '../lib/pricing.js';
 import { titleLine, subLine } from '../lib/format.js';
+import { softHookFor } from '../lib/model.js';
 import { sendText, sendImage } from '../lib/messenger.js';
 
-const N = (x)=> Number(String(x??'').replace(/[^\d]/g,'')) || 0;
+const N = (x)=> Number(String(x ?? '').replace(/[^\d]/g,'')) || 0;
 
 function softFilter(units, slots) {
-  // very light gate to avoid wild mismatches; we keep it wide so rank() can sort properly
+  // Keep wide gates; let rank() do the heavy lift
   return units.filter(u => {
     if (slots.plan === 'cash' && slots.budget) {
       const srp = N(u.srp); if (!srp) return false;
@@ -19,7 +21,7 @@ function softFilter(units, slots) {
       if (ai > slots.budget + 200000) return false;
     }
     if (slots.body_type && String(u.body_type||'').toLowerCase() !== String(slots.body_type).toLowerCase()) return false;
-    if (slots.transmission && slots.transmission!=='any') {
+    if (slots.transmission && slots.transmission !== 'any') {
       const tx = String(u.transmission||'').toLowerCase();
       if (slots.transmission==='automatic' && !/(a\/?t|automatic|auto)/.test(tx)) return false;
       if (slots.transmission==='manual'    && !/(m\/?t|manual)/.test(tx)) return false;
@@ -38,7 +40,7 @@ export async function startOffers(psid, session) {
   const subset = softFilter(inv, session.slots);
   const ranked = rank(subset, session.slots);
 
-  // take top 4, show first 2 now
+  // Take top 4; show first 2 first
   const pick = ranked.slice(0, 4);
   session.picks = {
     list: pick.map(u => String(u.SKU || u.sku || `${u.brand}-${u.model}-${u.year}`)),
@@ -47,10 +49,9 @@ export async function startOffers(psid, session) {
   };
   session.picks.backup = session.picks.list.slice(2);
 
-  // summary message already sent in Part 1; here we go straight to units
   const first2 = pick.slice(0,2);
   if (!first2.length) {
-    await sendText(psid, "Walang exact na pasok sa filters mo — pwede kitang i-widenan ng konti (budget/body type). Type **widen** kung okay.");
+    await sendText(psid, "Walang exact na pasok sa filters mo — pwede kitang i-widenan ng konti (budget o body type). Type **widen** kung okay.");
     session.phase = 'p2_pick';
     return;
   }
@@ -58,14 +59,18 @@ export async function startOffers(psid, session) {
   for (let i=0;i<first2.length;i++){
     const u = first2[i];
     session.picks.shown.push(session.picks.list[i]);
+
     const imgs = imageList(u);
     if (imgs[0]) await sendImage(psid, imgs[0]);
 
+    const hook = (await softHookFor(u)) || '';
     const msg = [
       titleLine(u),
       subLine(u),
-      priceBlock(u, session.slots.plan)
+      priceBlock(u, session.slots.plan),
+      hook
     ].filter(Boolean).join('\n');
+
     await sendText(psid, msg);
   }
 
@@ -90,9 +95,18 @@ export async function pickOrOthers(psid, session, userText) {
     for (const sku of backSkus) {
       const u = bySku.get(String(sku));
       if (!u) continue;
+
       const imgs = imageList(u);
       if (imgs[0]) await sendImage(psid, imgs[0]);
-      const msg = [titleLine(u), subLine(u), priceBlock(u, session.slots.plan)].join('\n');
+
+      const hook = (await softHookFor(u)) || '';
+      const msg = [
+        titleLine(u),
+        subLine(u),
+        priceBlock(u, session.slots.plan),
+        hook
+      ].filter(Boolean).join('\n');
+
       await sendText(psid, msg);
     }
     await sendText(psid, `Type **1**, **2**, **3**, or **4** to pick. (Order based on messages above)`);
@@ -113,14 +127,14 @@ export async function pickOrOthers(psid, session, userText) {
 
     session.chosen = { sku, unit: u };
 
-    // send gallery
+    // send gallery (image_1..image_10)
     const imgs = imageList(u);
     if (imgs.length) {
       await sendText(psid, "Nice choice! 🔥 Sending full photos…");
       for (const url of imgs) await sendImage(psid, url);
     }
 
-    // go to Phase 3
+    // go to Phase 3 based on plan
     session.phase = (session.slots.plan === 'cash') ? 'p3_cash' : 'p3_fin';
     return;
   }
