@@ -1,30 +1,51 @@
+// api/lib/state.js
 const SESS = new Map(); // psid -> state
 
 const newSession = () => ({
   createdAt: Date.now(),
   updatedAt: Date.now(),
-  // 7-day memory window handled naively here (we'll hard reset beyond)
-  slots: { plan:null, budget:null, location:null, transmission:null, body_type:null,
-           brand_pref:null, model_pref:null, year_pref:null, variant_pref:null },
-  lastAsked: null,          // which slot we last asked
-  lastPromptAt: 0,          // debounce
-  lastUserAt: 0,            // for idle follow-up timers
-  nudgeCount: 0,            // Phase 1 nudges sent
-  phase: 'p1',              // p1/p2/p3_cash/p3_fin
-  isReturning: false
+  lastUserAt: 0,
+
+  phase: 'p1',
+
+  slots: {
+    plan: null, budget: null, location: null, transmission: null, body_type: null,
+    brand_pref: null, model_pref: null, year_pref: null, variant_pref: null
+  },
+
+  lastAsked: null,
+  lastPromptAt: 0,
+
+  isWelcomed: false,
+  isReturning: false,
+
+  // picks/chosen set in Offers
+  picks: null,
+  chosen: null,
+
+  // Phase 3
+  schedule: null,
+  contact: null,
+  fin: null,
+  docs: null,
+  _docsAsked: false,
+  _addrShown: false,
+  _finLinesShown: false,
+
+  // Nudges state
+  nudges: {
+    p1: { lastAt: 0, count: 0 },
+    docs: { lastAt: 0, count: 0 }
+  }
 });
 
 export function getSession(psid) {
   let s = SESS.get(psid);
   const now = Date.now();
   if (!s) {
-    s = newSession();
-    SESS.set(psid, s);
-  } else {
-    // reset if > 7 days
-    if (now - s.updatedAt > 7*24*60*60*1000) {
-      s = newSession(); SESS.set(psid, s);
-    }
+    s = newSession(); SESS.set(psid, s);
+  } else if (now - s.updatedAt > 7*24*60*60*1000) {
+    s = newSession(); SESS.set(psid, s); // 7-day reset
   }
   return s;
 }
@@ -36,13 +57,14 @@ export function resetSession(psid) {
   SESS.set(psid, newSession());
 }
 
+// Activity
 export function markUserActivity(psid) {
   const s = getSession(psid);
   s.lastUserAt = Date.now();
   saveSession(psid, s);
 }
 
-/** simple debounce: avoid re-asking same slot within 1.5s */
+// Debounce same-slot prompts
 export function shouldDebounce(psid, slot) {
   const s = getSession(psid);
   const now = Date.now();
@@ -53,3 +75,11 @@ export function shouldDebounce(psid, slot) {
   return false;
 }
 
+// For cron nudger
+export function getAllSessions() {
+  const arr = [];
+  for (const [psid, session] of SESS.entries()) {
+    arr.push({ psid, session });
+  }
+  return arr;
+}
