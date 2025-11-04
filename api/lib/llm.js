@@ -1,7 +1,7 @@
 // api/lib/llm.js
-// Lightweight “LLM helpers” without external calls — keeps responses human, short, adaptive.
+// Lightweight helpers to keep tone human and short, with tiny in-memory memory.
 
-const MEMORY = new Map(); // psid -> { lastSeen: ts }
+const MEMORY = new Map(); // psid -> { lastSeen: number }
 
 export function remember(psid) {
   MEMORY.set(psid, { lastSeen: Date.now() });
@@ -13,40 +13,34 @@ export function recall(psid) {
 
 export async function forgetIfRestart(msg, psid, session) {
   if (!/^(restart|start over|reset)$/i.test(msg)) return false;
-  // wipe prefs but keep minimal record
   session.prefs = {
-    plan:null, city:null, body:null, trans:null,
-    budgetMin:null, budgetMax:null, dpMin:null, dpMax:null,
-    model:null, year:null
+    plan: null, city: null, body: null, trans: null,
+    budgetMin: null, budgetMax: null, dpMin: null, dpMax: null,
+    model: null, year: null
   };
   return true;
 }
 
-// Tone B: semi-professional, warm. “Smart Short” trimming.
 export function adaptTone(text, userMsg) {
-  const casual = /\b(pare|bro|tol|hehe|lol)\b/i.test(userMsg);
-  if (casual) {
-    return text
-      .replace(/po\b/gi,'')
-      .replace('Tutulungan kitang','Tutulungan kita');
+  // very light adaptation; remove extra formality if user is casual
+  if (/\b(pare|bro|tol|hehe|lol)\b/i.test(userMsg)) {
+    return text.replace(/\bpo\b/gi, '');
   }
   return text;
 }
 
 export function smartShort(text) {
-  // Keep to ~1–2 sentences max; split and trim
-  const sentences = text.split(/(?<=[.!?])\s+/).filter(Boolean);
-  const take = sentences.slice(0, 2).join(' ');
+  const parts = text.split(/(?<=[.!?])\s+/).filter(Boolean);
+  const take = parts.slice(0, 2).join(' ');
   return take.length ? take : text;
 }
 
-// Pull quick clues from user messages (model, year, etc.)
 export function extractClues(msg, session) {
   // model guess
   const mdl = msg.match(/\b(vios|mirage|city|altis|civic|fortuner|everest|montero|terra|nv350|urvan|hiace|starex|innova|raize|livina|traviz|ranger|hilux|strada|navara)\b/i);
   if (mdl) session.prefs.model = mdl[1].toLowerCase();
 
-  // year guess (2014–2026)
+  // year guess (2014..2026)
   const yr = msg.match(/\b(20(1[4-9]|2[0-6]))\b/);
   if (yr) session.prefs.year = Number(yr[1]);
 }
