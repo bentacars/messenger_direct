@@ -1,5 +1,13 @@
 export const config = { runtime: 'edge' };
 
+import { pickModel, pickTemp } from './lib/llm.js';
+
+// Pull from your Vercel env (you said they’re set)
+const MODEL = pickModel(process.env.MODEL_DEFAULT, 'gpt-4.1-mini');
+const TEMP  = pickTemp(process.env.TEMP_DEFAULT, 0.35);
+
+// Example OpenAI call (adjust to your client):
+// openai.chat.completions.create({ model: MODEL, temperature: TEMP, ... })
 import {
   sendText, sendTypingOn, sendTypingOff,
   sendImage, sendQuickReplies, sendGenericTemplate
