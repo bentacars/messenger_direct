@@ -1,8 +1,6 @@
 {
-  "name": "messenger_direct",
+  "name": "bentacars-messenger-ai",
   "version": "1.0.0",
   "type": "module",
-  "dependencies": {
-    "node-fetch": "3.x"
-  }
+  "dependencies": {}
 }
