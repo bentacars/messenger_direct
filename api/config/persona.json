@@ -1,1 +1,6 @@
-
+{
+  "tone": "B",
+  "length": "SmartShort",
+  "adaptive": true,
+  "memory_days": 7
+}
