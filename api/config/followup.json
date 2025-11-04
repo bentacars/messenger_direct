@@ -1,0 +1,16 @@
+{
+  "phase1": {
+    "interval_min": 15,
+    "max_attempts": 8,
+    "quiet_start": "21:00",
+    "quiet_end": "09:00",
+    "tz": "Asia/Manila"
+  },
+  "docs": {
+    "interval_min": 120,
+    "max_hours": 72,
+    "quiet_start": "21:00",
+    "quiet_end": "09:00",
+    "tz": "Asia/Manila"
+  }
+}
