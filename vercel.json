@@ -1,0 +1,15 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "functions": {
+    "api/**/*.js": {
+      "runtime": "nodejs"
+    }
+  },
+  "routes": [
+    { "src": "^/api/webhook$", "dest": "/api/webhook.js" },
+    { "src": "^/api/nudge$", "dest": "/api/nudge.js" }
+  ],
+  "crons": [
+    { "path": "/api/nudge", "schedule": "*/15 * * * *" }
+  ]
+}
