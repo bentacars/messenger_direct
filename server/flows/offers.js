@@ -130,6 +130,23 @@ export async function step(session, userText, rawEvent) {
 // - Applies hidden pricing rules based on payment + budget
 // - Builds up to 4 items total, prioritizing "Priority" tier first, then "OK to Market"
 
+/* ============================ Strong Wants Helpers =========================== */
+// Extract explicit brand/model/year/variant preference from Phase 1
+function strongWants(qual = {}) {
+  return {
+    brand: (qual.brand || '').trim(),
+    model: (qual.model || '').trim(),
+    year: qual.year ? String(qual.year).trim() : '',
+    variant: (qual.variant || '').trim(),
+  };
+}
+function hasStrongWants(w = {}) {
+  return !!(w.brand || w.model || w.year || w.variant);
+}
+
+/* ============================ Pool builder ============================== */
+async function buildPool(qual) {
+
 async function buildPool(qual) {
   if (!INVENTORY_API_URL) return { pool: [], error: 'INVENTORY_API_URL missing' };
   try {
