@@ -1,5 +1,6 @@
 // /server/flows/offers.js
-// PHASE 2: Retrieval + display logic aligned to your spec
+// Phase 2 — match up to 4 units (Priority → OK to Market), show 2 first, backup 2 on "Others".
+// When a unit is chosen, send a photo CAROUSEL (image_1..image_10) then move to next phase.
 
 const INVENTORY_API_URL = process.env.INVENTORY_API_URL || '';
 
@@ -9,110 +10,66 @@ export async function step(session, userText, rawEvent) {
   const t = String(userText || '').toLowerCase();
 
   session.funnel = session.funnel || {};
-  session._offers = session._offers || { page: 0, widened: false, othersCount: 0 };
+  session._offers = session._offers || { page: 0, pool: [], tier: '' };
 
-  // Handle "Others" button/intent
+  // Paging
   if (payload === 'SHOW_OTHERS' || /\bothers?\b/.test(t)) {
-    session._offers.othersCount = (session._offers.othersCount || 0) + 1;
-
-    // First "Others": advance page (to show backup 2)
-    if (session._offers.othersCount === 1) {
-      session._offers.page += 1;
-    }
-    // Second "Others": ask to widen
-    else if (session._offers.othersCount >= 2) {
-      messages.push({
-        type: 'buttons',
-        text: 'Gusto mo bang i-widen ko yung search? Pwede akong maghanap outside your body type or i-adjust konti ang price range.',
-        buttons: [
-          { title: 'Widen search ✅', payload: 'WIDEN_SEARCH' },
-          { title: 'Keep as is ❌', payload: 'KEEP_AS_IS' },
-        ],
-      });
-      return { session, messages };
-    }
+    session._offers.page = (session._offers.page || 0) + 1;
   }
 
-  if (payload === 'WIDEN_SEARCH') {
-    session._offers.widened = true;
-    session._offers.page = 0;
-    session._offers.othersCount = 0;
-  }
-  if (payload === 'KEEP_AS_IS') {
-    // keep filters, just cycle more if possible
-    session._offers.page += 1;
-  }
-
-  // ----- FETCH + RANK -----
   const qual = session.qualifier || {};
-  const { items, error } = await getRankedInventory(qual, session._offers.widened);
+  const { pool, error } = await buildPool(qual); // returns up to 4 units in correct tier order
 
   if (error) {
-    messages.push({ type: 'text', text: `⚠️ Nagka-issue sa inventory: ${error}. Try mo ulit o revise filters (e.g., “SUV automatic ₱800k QC”).` });
+    messages.push({ type: 'text', text: `⚠️ Nagka-issue sa inventory: ${error}. Try ulit after a moment or adjust filters (e.g., “SUV AT ₱800k QC”).` });
+    return { session, messages };
+  }
+  if (!pool.length) {
+    messages.push({ type: 'text', text: 'Walang exact match sa filters na ’to. Pwede kitang i-tryhan ng alternatives — type mo “Others”.' });
     return { session, messages };
   }
 
-  if (!items.length) {
-    messages.push({ type: 'text', text: 'Walang exact match sa ngayon. Pwede kitang i-match sa alternatives—type mo “Others”.' });
-    return { session, messages };
-  }
+  // Save latest pool (max 4)
+  session._offers.pool = pool.slice(0, 4);
 
-  // Up to 4 matches overall
-  const top4 = items.slice(0, 4);
-
-  // Compute which 2 to show this round
+  // 2 per page
   const PAGE_SIZE = 2;
   const start = (session._offers.page || 0) * PAGE_SIZE;
-  let slice = top4.slice(start, start + PAGE_SIZE);
-
-  // If page overflow, loop back
+  let slice = session._offers.pool.slice(start, start + PAGE_SIZE);
   if (!slice.length) {
     session._offers.page = 0;
-    slice = top4.slice(0, PAGE_SIZE);
+    slice = session._offers.pool.slice(0, PAGE_SIZE);
   }
 
-  // ----- SEND two units as separate messages -----
-  for (const unit of slice) {
-    // IMAGE first
-    if (unit.image_1) {
-      messages.push({ type: 'image', url: unit.image_1 });
-    }
+  // If user has tapped a Unit or asked for "more photos", send gallery
+  const pickPayload = payload?.startsWith('CHOOSE_') ? payload.replace(/^CHOOSE_/, '') : '';
+  const wantMorePhotos = /^(more\s+(photos|pics|images)|lahat\s+ng\s+photos|gallery)$/i.test(String(userText || '').trim());
 
-    // Build text by payment mode (cash vs financing)
-    const isCash = (qual.payment || '').toLowerCase() === 'cash';
-    const line1 = `${fmtYearBrandModelVar(unit)}\n${fmtMileageLoc(unit)}`;
-    const line2 = isCash
-      ? (unit.srp ? `SRP: ₱${money(unit.srp)} (negotiable upon viewing)` : '')
-      : (unit.all_in ? `All-in: ₱${money(unit.all_in)} (subject for approval)` : 'All-in available (subject for approval)');
-    const hook = quickHook(unit); // simple knowledge hook
+  if (pickPayload || wantMorePhotos) {
+    const chosen = pickPayload
+      ? session._offers.pool.find(x => x.SKU === pickPayload)
+      : session.funnel?.unit?.raw;
 
-    messages.push({
-      type: 'text',
-      text: [line1, line2, hook].filter(Boolean).join('\n'),
-    });
-  }
-
-  // ----- Buttons after first 2 -----
-  const btns = [];
-  slice.forEach((u, idx) => {
-    btns.push({ title: `Unit ${idx + 1}`, payload: `CHOOSE_${u.SKU}` });
-  });
-  btns.push({ title: 'Others', payload: 'SHOW_OTHERS' });
-  messages.push({ type: 'buttons', text: 'Pili ka:', buttons: btns });
-
-  // ----- Handle CHOOSE_* (send photos + transition) -----
-  if (payload?.startsWith('CHOOSE_')) {
-    const chosenId = payload.replace(/^CHOOSE_/, '');
-    const chosen = top4.find(x => x.SKU === chosenId) || items.find(x => x.SKU === chosenId);
     if (chosen) {
       session.funnel.unit = { id: chosen.SKU, label: fmtTitle(chosen), raw: chosen };
 
       messages.push({ type: 'text', text: 'Solid choice! 🔥 Sending full photos…' });
 
-      const imgs = getAllImages(chosen);
-      for (const url of imgs) messages.push({ type: 'image', url });
+      const images = getAllImages(chosen);
+      if (images.length) {
+        const elements = images.slice(0, 10).map((url, i) => ({
+          title: i === 0 ? fmtTitle(chosen) : `Photo ${i + 1}`,
+          image_url: url,
+          buttons: (i === 0 && chosen.drive_link)
+            ? [{ type: 'web_url', title: 'Details', url: chosen.drive_link }]
+            : []
+        }));
+        messages.push({ type: 'generic', elements }); // carousel gallery
+      } else {
+        messages.push({ type: 'text', text: 'Walang extra photos uploaded for this unit yet. Pwede kong i-request sa dealer. 🙏' });
+      }
 
-      // Auto-transition if payment already known; else ask
+      // Auto-transition based on Phase 1 payment
       const pay = (qual.payment || '').toLowerCase();
       if (pay === 'cash' || pay === 'financing') {
         session.nextPhase = pay === 'cash' ? 'cash' : 'financing';
@@ -130,7 +87,29 @@ export async function step(session, userText, rawEvent) {
     }
   }
 
-  // Branch if user typed/tapped payment after seeing units
+  // Show 2 units as separate messages (not a carousel)
+  for (const unit of slice) {
+    if (unit.image_1) messages.push({ type: 'image', url: unit.image_1 });
+
+    const isCash = (qual.payment || '').toLowerCase() === 'cash';
+    const line1 = `${fmtTitle(unit)}\n${fmtMileageLoc(unit)}`;
+    const line2 = isCash
+      ? (unit.srp ? `SRP: ₱${money(unit.srp)} (negotiable upon viewing)` : '')
+      : (unit.all_in ? `All-in: ₱${money(unit.all_in)} (subject for approval)` : 'All-in available (subject for approval)');
+    const hook = quickHook(unit);
+
+    messages.push({ type: 'text', text: [line1, line2, hook].filter(Boolean).join('\n') });
+  }
+
+  // Buttons: Unit X labels reflect absolute index in pool
+  const btns = [];
+  slice.forEach((u, idx) => {
+    btns.push({ title: `Unit ${start + idx + 1}`, payload: `CHOOSE_${u.SKU}` });
+  });
+  btns.push({ title: 'Others', payload: 'SHOW_OTHERS' });
+  messages.push({ type: 'buttons', text: 'Pili ka:', buttons: btns });
+
+  // Allow branch to Phase 3 if user declares payment here (seldom)
   if (payload === 'CASH' || /\bcash\b/.test(t)) {
     session.nextPhase = 'cash';
     messages.push({ type: 'text', text: 'Sige, Cash path tayo. I-schedule natin ang viewing.' });
@@ -145,26 +124,25 @@ export async function step(session, userText, rawEvent) {
   return { session, messages };
 }
 
-/* ================= FETCH + RANK per spec ================= */
+/* ============================ Pool builder ============================== */
+// - Pulls from INVENTORY_API_URL
+// - Applies strong wants (brand/model/year/variant) as *filters* if present
+// - Applies hidden pricing rules based on payment + budget
+// - Builds up to 4 items total, prioritizing "Priority" tier first, then "OK to Market"
 
-async function getRankedInventory(qual, widened = false) {
-  if (!INVENTORY_API_URL) return { items: [], error: 'INVENTORY_API_URL missing' };
-
+async function buildPool(qual) {
+  if (!INVENTORY_API_URL) return { pool: [], error: 'INVENTORY_API_URL missing' };
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 8000);
     const res = await fetch(INVENTORY_API_URL, { signal: controller.signal });
     clearTimeout(timeout);
 
-    if (!res.ok) return { items: [], error: `HTTP ${res.status}` };
+    if (!res.ok) return { pool: [], error: `HTTP ${res.status}` };
     const raw = await res.json();
-    const arr = Array.isArray(raw) ? raw : (Array.isArray(raw?.items) ? raw.items : []);
-    if (!arr.length) return { items: [], error: null };
+    let items = (Array.isArray(raw) ? raw : raw?.items || []).map(normalizeFromSheet);
 
-    // Normalize
-    let items = arr.map(normalizeFromSheet);
-
-    // Strong brand/model/year/variant filters when provided
+    // Strong wants
     const want = strongWants(qual);
     if (hasStrongWants(want)) {
       items = items.filter(u =>
@@ -173,27 +151,128 @@ async function getRankedInventory(qual, widened = false) {
         (!want.year    || String(u.year) === String(want.year)) &&
         (!want.variant || contains(u.variant, want.variant))
       );
-    } else {
-      // Only Phase 1 fields if brand/model/year/variant not specified
-      items = items.filter(u => softPhase1Filter(u, qual, widened));
     }
 
-    // Priority order: price_status = "Priority" first, else "OK to Market"
-    items.sort((a, b) => priorityRank(b.price_status) - priorityRank(a.price_status));
+    // Apply hidden Phase-1 pricing rules + soft filters (body/trans/location)
+    const filtered = items.filter(u => softPhase1Filter(u, qual));
 
-    // Score within those tiers
-    const scored = items
-      .map(u => ({ u, s: scoreUnit(u, qual, widened) }))
-      .sort((A, B) => B.s - A.s);
+    // Partition by price_status
+    const pri  = filtered.filter(u => isPriority(u.price_status));
+    const okm  = filtered.filter(u => isOKtoMarket(u.price_status));
+    const rest = filtered.filter(u => !isPriority(u.price_status) && !isOKtoMarket(u.price_status));
 
-    // Return top 4 only
-    return { items: scored.map(x => x.u).slice(0, 4), error: null };
+    // Score within each tier for ordering
+    const order = arr => arr
+      .map(u => ({ u, s: scoreUnit(u, qual) }))
+      .sort((A, B) => B.s - A.s)
+      .map(x => x.u);
+
+    const priOrdered = order(pri);
+    const okmOrdered = order(okm);
+    const restOrdered = order(rest);
+
+    // Build pool: first 2 from Priority (else OKM), then backup 2 from same tier; if underfilled, borrow from the other tier, then 'rest'
+    let pool = [];
+    const take = (arr, n) => { const out = arr.slice(0, n); arr.splice(0, n); return out; };
+
+    let a = [...priOrdered], b = [...okmOrdered], c = [...restOrdered];
+
+    // first 2
+    if (a.length >= 2)      pool.push(...take(a, 2));
+    else if (b.length >= 2) pool.push(...take(b, 2));
+    else                    pool.push(...take(a, 2), ...take(b, 2), ...take(c, 2));
+
+    // backup 2
+    if (pool.length < 4) {
+      if (a.length) pool.push(...take(a, Math.min(2, 4 - pool.length)));
+    }
+    if (pool.length < 4) {
+      if (b.length) pool.push(...take(b, Math.min(2, 4 - pool.length)));
+    }
+    if (pool.length < 4 && c.length) {
+      pool.push(...take(c, Math.min(2, 4 - pool.length)));
+    }
+
+    // Cap to 4
+    pool = uniqueBySKU(pool).slice(0, 4);
+    return { pool, error: null };
   } catch (e) {
-    return { items: [], error: e.name === 'AbortError' ? 'timeout' : (e.message || 'fetch error') };
+    return { pool: [], error: e.name === 'AbortError' ? 'timeout' : (e.message || 'fetch error') };
   }
 }
 
-/* ================= Normalization (sheet headers a→am) ================= */
+/* ============================ Filters/Scoring =========================== */
+
+// Phase-1 hidden rule + soft filters
+function softPhase1Filter(u, qual = {}) {
+  const pay  = (qual.payment || '').toLowerCase(); // 'cash' or 'financing'
+  const bud  = toNum(qual.budget);
+  const body = (qual.bodyType || '').toLowerCase();
+  const trans= (qual.transmission || '').toLowerCase();
+  const loc  = (qual.location || '').toLowerCase();
+
+  // Body/trans if specified
+  if (body && body !== 'any' && !eq(u.body_type, body)) return false;
+  if (trans && trans !== 'any' && !eq(u.transmission, trans)) return false;
+
+  // Hidden price rules
+  if (bud > 0) {
+    if (pay === 'cash') {
+      const srp = u.srp || 0;
+      if (Math.abs(srp - bud) > 50_000) return false; // ± ₱50k
+    } else if (pay === 'financing') {
+      const ai = u.all_in || 0;
+      if (!(ai > 0 && ai <= bud + 50_000)) return false; // ≤ budget + ₱50k
+    }
+  }
+
+  // Location fuzzy (if provided)
+  if (loc) {
+    const locs = [u.city, u.province, u.ncr_zone].map(x => (x || '').toLowerCase());
+    if (!locs.some(x => x && (x.includes(loc) || loc.includes(x)))) return false;
+  }
+
+  return true;
+}
+
+function scoreUnit(u, qual = {}) {
+  let s = 0;
+  // Body/trans affinity
+  if (qual.bodyType && qual.bodyType !== 'any') s += eq(u.body_type, qual.bodyType) ? 6 : -2;
+  if (qual.transmission && qual.transmission !== 'any') s += eq(u.transmission, qual.transmission) ? 4 : -2;
+
+  // Budget closeness
+  const bud = toNum(qual.budget);
+  const pay = (qual.payment || '').toLowerCase();
+  if (bud > 0) {
+    if (pay === 'cash' && u.srp) {
+      const diff = Math.abs(u.srp - bud);
+      if (diff <= 20_000) s += 6;
+      else if (diff <= 50_000) s += 3;
+      else if (diff <= 100_000) s += 1;
+      else s -= 2;
+    }
+    if (pay === 'financing' && u.all_in) {
+      if (u.all_in <= bud + 50_000) s += 6;
+      else s -= 2;
+    }
+  }
+
+  // Location proximity
+  if (qual.location) {
+    const want = (qual.location || '').toLowerCase();
+    const locs = [u.city, u.province, u.ncr_zone].map(x => (x || '').toLowerCase());
+    if (locs.some(x => x && (x.includes(want) || want.includes(x)))) s += 3;
+  }
+
+  // Recency + newer year bonus
+  if (u.updated_at) s += 1;
+  if (u.year) s += Math.min(3, Math.max(0, +u.year - 2015) * 0.2);
+
+  return s;
+}
+
+/* ============================== Normalization =========================== */
 
 function normalizeFromSheet(src = {}) {
   const safe = k => (src[k] ?? '').toString().trim();
@@ -228,7 +307,7 @@ function normalizeFromSheet(src = {}) {
     term3: toNum(safe('3yrs')),
     term4: toNum(safe('4yrs')),
     all_in: toNum(safe('all_in')),
-    price_status: safe('price_status'), // "Priority" / "OK to Market" / etc.
+    price_status: safe('price_status'),
     complete_address: safe('complete_address'),
     city: safe('city'),
     province: safe('province'),
@@ -240,130 +319,21 @@ function normalizeFromSheet(src = {}) {
     markup_rate: safe('markup_rate'),
   };
 
-  // fallback title + quick fields for display
   obj.title = fmtTitle(obj);
   obj.locationText = [obj.city, obj.province || obj.ncr_zone].filter(Boolean).join(', ');
   return obj;
 }
 
-/* ================= Filters/Scoring per spec ================= */
+/* ============================== Render helpers ========================== */
 
-function strongWants(qual = {}) {
-  // you can set qual.brand/model/year/variant upstream if captured
-  return {
-    brand: (qual.brand || '').trim(),
-    model: (qual.model || '').trim(),
-    year: qual.year ? String(qual.year).trim() : '',
-    variant: (qual.variant || '').trim(),
-  };
-}
-function hasStrongWants(w) {
-  return !!(w.brand || w.model || w.year || w.variant);
-}
-
-// Phase 1 only: payment, budget, location, transmission, bodyType
-function softPhase1Filter(u, qual = {}, widened = false) {
-  const pay = (qual.payment || '').toLowerCase();
-  const budget = toNum(qual.budget);
-  const body = (qual.bodyType || '').toLowerCase();
-  const trans = (qual.transmission || '').toLowerCase();
-  const loc = (qual.location || '').toLowerCase();
-
-  // Body type
-  if (body && body !== 'any' && !widened) {
-    if (!eq(u.body_type, body)) return false;
-  }
-  // Transmission
-  if (trans && trans !== 'any' && !widened) {
-    if (!eq(u.transmission, trans)) return false;
-  }
-  // Pricing logic (hidden): cash → SRP within ±50k; financing → all_in <= budget + 50k
-  if (budget > 0) {
-    if (pay === 'cash') {
-      const srp = u.srp || 0;
-      if (Math.abs(srp - budget) > 50_000) return false;
-    } else if (pay === 'financing') {
-      const ai = u.all_in || 0;
-      const max = budget + 50_000 * (widened ? 3 : 1); // widen lets us go +150k
-      if (!(ai > 0 && ai <= max)) return false;
-    }
-  }
-  // Location (fuzzy)
-  if (loc) {
-    const locs = [u.city, u.province, u.ncr_zone].map(x => (x || '').toLowerCase());
-    if (!locs.some(x => x && (x.includes(loc) || loc.includes(x)))) {
-      if (!widened) return false;
-    }
-  }
-  return true;
-}
-
-function scoreUnit(u, qual = {}, widened = false) {
-  let s = 0;
-
-  // Prioritize price_status
-  s += priorityRank(u.price_status) * 10;
-
-  // Body type/transmission affinity
-  if (qual.bodyType && qual.bodyType !== 'any') s += eq(u.body_type, qual.bodyType) ? 6 : -2;
-  if (qual.transmission && qual.transmission !== 'any') s += eq(u.transmission, qual.transmission) ? 4 : -2;
-
-  // Budget closeness scoring
-  const budget = toNum(qual.budget);
-  const pay = (qual.payment || '').toLowerCase();
-  if (budget > 0) {
-    if (pay === 'cash' && u.srp) {
-      const diff = Math.abs(u.srp - budget);
-      if (diff <= 20_000) s += 6;
-      else if (diff <= 50_000) s += 3;
-      else if (diff <= 100_000) s += 1;
-      else s -= 2;
-    }
-    if (pay === 'financing' && u.all_in) {
-      const max = budget + 50_000 * (widened ? 3 : 1);
-      if (u.all_in <= max) s += 6;
-      else s -= 2;
-    }
-  }
-
-  // Location proximity
-  if (qual.location) {
-    const want = (qual.location || '').toLowerCase();
-    const locs = [u.city, u.province, u.ncr_zone].map(x => (x || '').toLowerCase());
-    if (locs.some(x => x && (x.includes(want) || want.includes(x)))) s += 3;
-  }
-
-  // Recency (updated_at) bonus
-  if (u.updated_at) s += 1;
-
-  // Newer year
-  if (u.year) s += Math.min(3, Math.max(0, +u.year - 2015) * 0.2);
-
-  return s;
-}
-
-function priorityRank(ps = '') {
-  const v = (ps || '').toLowerCase();
-  if (v.includes('priority')) return 2;
-  if (v.includes('ok') && v.includes('market')) return 1;
-  return 0;
-}
-
-/* ================= Render helpers ================= */
-
-function fmtTitle(u) {
-  return [u.year, u.brand, u.model, u.variant].filter(Boolean).join(' ');
-}
-function fmtYearBrandModelVar(u) {
-  return [u.year, u.brand, u.model, u.variant].filter(Boolean).join(' ');
-}
+function fmtTitle(u) { return [u.year, u.brand, u.model, u.variant].filter(Boolean).join(' '); }
 function fmtMileageLoc(u) {
   const m = u.mileage ? `${numberWithCommas(u.mileage)} km` : '';
   const loc = u.locationText || [u.city, u.province || u.ncr_zone].filter(Boolean).join(', ');
   return [m, loc].filter(Boolean).join(' — ');
 }
+
 function quickHook(u) {
-  // Tiny model hooks (Phase 2.5 can replace with /lib/vehicle_specs.js)
   const model = (u.model || '').toLowerCase();
   if (/vios/.test(model)) return 'Matipid sa gas, mura maintenance ✅';
   if (/innova/.test(model)) return '7-seater, pang-pamilya, diesel tipid ✅';
@@ -372,12 +342,13 @@ function quickHook(u) {
   if (/fortuner|everest/.test(model)) return 'Malakas hatak, mataas ground clearance 🛞';
   return 'Parts are easy to find, high resale demand 👍';
 }
+
 function getAllImages(u) {
   const keys = ['image_1','image_2','image_3','image_4','image_5','image_6','image_7','image_8','image_9','image_10'];
-  return keys.map(k => u[k]).filter(x => !!x);
+  return keys.map(k => u[k]).filter(Boolean);
 }
 
-/* ================= Misc utils ================= */
+/* ============================== Utils =================================== */
 
 function getPayload(evt) {
   const p = evt?.postback?.payload;
@@ -394,3 +365,20 @@ function money(n) { return numberWithCommas(n); }
 function eq(a, b) { return (a || '').toString().trim().toLowerCase() === (b || '').toString().trim().toLowerCase(); }
 function contains(a, b) { return (a || '').toLowerCase().includes((b || '').toLowerCase()); }
 function placeholder() { return 'https://via.placeholder.com/600x400?text=Unit'; }
+function uniqueBySKU(arr) {
+  const seen = new Set();
+  return arr.filter(x => {
+    const k = x.SKU || '';
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
+function isPriority(ps = '') {
+  const v = (ps || '').toLowerCase();
+  return v.includes('priority');
+}
+function isOKtoMarket(ps = '') {
+  const v = (ps || '').toLowerCase();
+  return v.includes('ok') && v.includes('market');
+}
