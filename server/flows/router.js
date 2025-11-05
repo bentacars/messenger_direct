@@ -1,4 +1,6 @@
 // /server/flows/router.js
+// Central conversation router: Phase 1 (qualifiers, conversational) → Phase 2 (offers) → Phase 3 (cash/financing)
+
 import * as Qualifier from './qualifier.js';
 import * as Offers from './offers.js';
 import * as CashFlow from './cash.js';
@@ -6,20 +8,21 @@ import * as FinancingFlow from './financing.js';
 
 const MEMORY_TTL_DAYS = Number(process.env.MEMORY_TTL_DAYS || 7);
 
+/* ========================= helpers: time/session ========================= */
 function isStale(ts) {
   const ttl = MEMORY_TTL_DAYS * 24 * 60 * 60 * 1000;
   return !ts || Date.now() - ts > ttl;
 }
 
-/* -------------------- Tone pack (conversational, Style 1+2) -------------------- */
+/* ========================= Tone pack (Style 1 + 2) ====================== */
 const HONORIFICS = ['sir', 'ma’am', 'boss'];
 const ACKS = ['Got it', 'Copy', 'Sige', 'Noted', 'Game', 'Solid'];
 
-function pick(a){ return a[Math.floor(Math.random()*a.length)] }
-function maybeHonor(){ return Math.random()<0.35 ? ` ${pick(HONORIFICS)}` : '' }
-function ack(){ return pick(ACKS) }
+function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+function maybeHonor() { return Math.random() < 0.35 ? ` ${pick(HONORIFICS)}` : ''; }
+function ack() { return pick(ACKS); }
 
-function askLine(kind){
+function askLine(kind) {
   const h = maybeHonor();
   const bank = {
     payment: [
@@ -46,24 +49,26 @@ function askLine(kind){
       `5-seater or 7+ seater ba hanap mo${h}? Or van/pickup ok din?`,
       `Body type mo${h}—5-seater, 7-seater/MPV/SUV, or van/pickup?`,
       `May prefer ka ba—sedan, SUV/MPV (7+), van, pickup—or ok lang any${h}?`,
-    ]
+    ],
   };
   return pick(bank[kind] || ['']);
 }
 
-function needPhase1(q){
-  return !(q?.payment && q?.budget && q?.location && q?.transmission && q?.bodyType);
+function needPhase1(qual) {
+  return !(qual?.payment && qual?.budget && qual?.location && qual?.transmission && qual?.bodyType);
 }
-function nextMissingKey(q){
-  if (!q.payment) return 'payment';
-  if (!q.budget) return 'budget';
-  if (!q.location) return 'location';
-  if (!q.transmission) return 'transmission';
-  if (!q.bodyType) return 'bodyType';
+
+function nextMissingKey(qual) {
+  if (!qual.payment) return 'payment';
+  if (!qual.budget) return 'budget';
+  if (!qual.location) return 'location';
+  if (!qual.transmission) return 'transmission';
+  if (!qual.bodyType) return 'bodyType';
   return null;
 }
-function askNextMissing(session){
-  const key = nextMissingKey(session.qualifier||{});
+
+function askNextMissing(session) {
+  const key = nextMissingKey(session.qualifier || {});
   if (!key) return null;
   if (!session._asked) session._asked = {};
   let line = askLine(key);
@@ -72,8 +77,8 @@ function askNextMissing(session){
   return line;
 }
 
-/* -------------------- Welcome / re-entry -------------------- */
-function welcomeBlock(session){
+/* ========================= welcome / re-entry =========================== */
+function welcomeBlock(session) {
   const firstTime = !session.createdAtTs || isStale(session.createdAtTs);
   if (firstTime) {
     return [{
@@ -91,44 +96,69 @@ function welcomeBlock(session){
   }];
 }
 
-/* -------------------- Main route -------------------- */
+/* ============================== MAIN ROUTE ============================== */
 export async function route(session, userText, rawEvent) {
   const messages = [];
   const now = Date.now();
 
-  // bootstrap
+  // bootstrap session
   session.createdAtTs = session.createdAtTs || now;
   session.phase = session.phase || 'phase1';
   session.qualifier = session.qualifier || {};
   session.funnel = session.funnel || {};
+  session._asked = session._asked || {};
 
   const payload = (rawEvent?.postback?.payload && String(rawEvent.postback.payload)) || '';
 
+  // Quick controls
   if (/^start over$/i.test(payload)) {
     session.phase = 'phase1';
     session.qualifier = {};
     session.funnel = {};
     session._welcomed = false;
     session._asked = {};
+    session._awaitingResume = false;
   }
 
-  /* -------------------- Phase 1 -------------------- */
+  /* --------------------------- Phase 1 --------------------------------- */
   if (session.phase === 'phase1') {
+    // Show welcome; for returning users, wait for choice (no qualifiers yet)
     if (!session._welcomed) {
-      messages.push(...welcomeBlock(session));
+      const blocks = welcomeBlock(session);
+      messages.push(...blocks);
       session._welcomed = true;
+
+      const firstTime = !session.createdAtTs || isStale(session.createdAtTs);
+      if (!firstTime) {
+        session._awaitingResume = true;
+        return { session, messages }; // wait for Continue/Start over
+      }
     }
 
-    // absorb Taglish inputs; extracts multiple values in one message
-    if (userText) session.qualifier = Qualifier.absorb(session.qualifier, userText);
+    // If returning and still waiting for a button tap, do nothing else
+    if (session._awaitingResume) {
+      if (payload === 'CONTINUE') {
+        session._awaitingResume = false; // proceed
+      } else if (/^start over$/i.test(payload)) {
+        session._awaitingResume = false; // reset was done above
+      } else {
+        return { session, messages };
+      }
+    }
 
+    // absorb Taglish inputs; extracts multiple values in one message (Qualifier.absorb)
+    if (userText) {
+      session.qualifier = Qualifier.absorb(session.qualifier, userText);
+    }
+
+    // ask only the next missing field
     if (needPhase1(session.qualifier)) {
       const ask = askNextMissing(session);
       if (ask) messages.push({ type: 'text', text: ask });
       return { session, messages };
     }
 
-    // Natural preface → Phase 2
+    // all qualifiers complete → natural preface before Phase 2
     const sum = Qualifier.summary(session.qualifier);
     messages.push({
       type: 'text',
@@ -138,20 +168,28 @@ export async function route(session, userText, rawEvent) {
         `Saglit, I’ll pull the best units that fit this. 🔎`,
     });
 
+    // hand over to Phase 2
     session.phase = 'phase2';
   }
 
-  /* -------------------- Phase 2 -------------------- */
+  /* --------------------------- Phase 2 --------------------------------- */
   if (session.phase === 'phase2') {
     const step = await Offers.step(session, userText, rawEvent);
     messages.push(...step.messages);
     session = step.session;
-    if (session.nextPhase === 'cash') session.phase = 'cash';
-    else if (session.nextPhase === 'financing') session.phase = 'financing';
-    else return { session, messages };
+
+    // move to Phase 3 when user chooses or decides payment path
+    if (session.nextPhase === 'cash') {
+      session.phase = 'cash';
+    } else if (session.nextPhase === 'financing') {
+      session.phase = 'financing';
+    } else {
+      // still browsing offers
+      return { session, messages };
+    }
   }
 
-  /* -------------------- Phase 3 (Cash) -------------------- */
+  /* ------------------------ Phase 3A: Cash ----------------------------- */
   if (session.phase === 'cash') {
     const step = await CashFlow.step(session, userText, rawEvent);
     messages.push(...step.messages);
@@ -159,7 +197,7 @@ export async function route(session, userText, rawEvent) {
     return { session, messages };
   }
 
-  /* -------------------- Phase 3 (Financing) -------------------- */
+  /* --------------------- Phase 3B: Financing --------------------------- */
   if (session.phase === 'financing') {
     const step = await FinancingFlow.step(session, userText, rawEvent);
     messages.push(...step.messages);
@@ -167,12 +205,16 @@ export async function route(session, userText, rawEvent) {
     return { session, messages };
   }
 
-  messages.push({ type: 'text', text: 'Sige, tuloy lang tayo. Cash or financing ang plan mo para ma-match ko properly?' });
+  /* ----------------------------- Fallback ------------------------------ */
+  messages.push({
+    type: 'text',
+    text: 'Sige, tuloy lang tayo. Cash or financing ang plan mo para ma-match ko properly?',
+  });
   session.phase = 'phase1';
   return { session, messages };
 }
 
-/* --- shim for older callers --- */
+/* -------- Optional shim: keep compatibility if code expects handleMessage --- */
 export async function handleMessage({ psid, text, raw }) {
   if (!globalThis.__SESS) globalThis.__SESS = new Map();
   const sess = globalThis.__SESS.get(psid) ?? { psid };
