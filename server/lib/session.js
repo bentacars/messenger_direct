@@ -1,45 +1,60 @@
 // server/lib/session.js
-// Uses Upstash KV if provided; otherwise in-memory (best-effort)
-const TTL_DAYS = Number(process.env.MEMORY_TTL_DAYS || 7);
-const TTL_SEC = TTL_DAYS * 24 * 60 * 60;
+// Stores session/state data per user (7-day memory window)
+// Requires Vercel KV binding: KV_REST_API_URL + KV_REST_API_TOKEN
+
+import fetch from "node-fetch";
 
 const KV_URL = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 
-const mem = new Map();
-
-async function kvGet(key) {
-  if (!KV_URL || !KV_TOKEN) return mem.get(key);
-  const r = await fetch(`${KV_URL}/get/${key}`, { headers: { Authorization: `Bearer ${KV_TOKEN}` } });
-  if (!r.ok) return null;
-  const j = await r.json();
-  return j?.result ? JSON.parse(j.result) : null;
+if (!KV_URL || !KV_TOKEN) {
+  console.warn("[session] Missing KV_REST_API_URL or KV_REST_API_TOKEN");
 }
 
-async function kvSet(key, val) {
-  if (!KV_URL || !KV_TOKEN) return mem.set(key, val);
-  await fetch(`${KV_URL}/set/${key}`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${KV_TOKEN}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ value: JSON.stringify(val), ex: TTL_SEC })
-  });
+function pk(psid) {
+  return `session:${psid}`;
 }
 
-async function kvDel(key) {
-  if (!KV_URL || !KV_TOKEN) return mem.delete(key);
-  await fetch(`${KV_URL}/del/${key}`, { method: 'POST', headers: { Authorization: `Bearer ${KV_TOKEN}` } });
+async function kvFetch(method, key, body) {
+  const url = `${KV_URL}/v1/kv/${key}`;
+  const opts = {
+    method,
+    headers: {
+      Authorization: `Bearer ${KV_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+  };
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(url, opts);
+  if (!r.ok) {
+    const t = await r.text().catch(() => "");
+    console.error(`[session] KV error ${method} ${key}`, r.status, t);
+  }
+  return r;
 }
 
 export async function getSession(psid) {
-  const s = (await kvGet(`sess:${psid}`)) || {};
-  return s;
+  const r = await kvFetch("GET", pk(psid));
+  if (!r || !r.ok) return null;
+  try {
+    return await r.json();
+  } catch {
+    return null;
+  }
 }
 
-export async function saveSession(psid, state) {
-  state._updated_at = Date.now();
-  await kvSet(`sess:${psid}`, state);
+export async function setSession(psid, data = {}) {
+  await kvFetch("PUT", pk(psid), data);
+  return data;
 }
 
 export async function clearSession(psid) {
-  await kvDel(`sess:${psid}`);
+  await kvFetch("DELETE", pk(psid));
+}
+
+export async function touchSession(psid) {
+  const sess = (await getSession(psid)) || {};
+  sess.updated_at = Date.now();
+  await setSession(psid, sess);
+  return sess;
 }
