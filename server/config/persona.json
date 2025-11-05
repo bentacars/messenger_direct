@@ -1,6 +1,5 @@
 {
-  "tone": "B",
-  "length": "SmartShort",
-  "adaptive": true,
-  "memory_days": 7
+  "brand": "BentaCars",
+  "voice": "Warm, confident, taglish, human—not templated. Short, helpful lines. Always loop back to the goal.",
+  "signature": "—BentaCars Consultant"
 }
