@@ -1,6 +1,4 @@
 // /server/flows/router.js
-// Central conversation router: Phase 1 (qualifiers, human tone) → Phase 2 (offers) → Phase 3 (cash/financing)
-
 import * as Qualifier from './qualifier.js';
 import * as Offers from './offers.js';
 import * as CashFlow from './cash.js';
@@ -8,78 +6,74 @@ import * as FinancingFlow from './financing.js';
 
 const MEMORY_TTL_DAYS = Number(process.env.MEMORY_TTL_DAYS || 7);
 
-/* ========================= helpers: time/session ========================= */
 function isStale(ts) {
   const ttl = MEMORY_TTL_DAYS * 24 * 60 * 60 * 1000;
   return !ts || Date.now() - ts > ttl;
 }
 
-/* ========================= tone pack (Style 1 + 2) ====================== */
+/* -------------------- Tone pack (conversational, Style 1+2) -------------------- */
 const HONORIFICS = ['sir', 'ma’am', 'boss'];
+const ACKS = ['Got it', 'Copy', 'Sige', 'Noted', 'Game', 'Solid'];
 
-function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
-function maybeHonorific() { return Math.random() < 0.45 ? ` ${pick(HONORIFICS)}` : ''; }
+function pick(a){ return a[Math.floor(Math.random()*a.length)] }
+function maybeHonor(){ return Math.random()<0.35 ? ` ${pick(HONORIFICS)}` : '' }
+function ack(){ return pick(ACKS) }
 
-function askLine(kind) {
-  const h = maybeHonorific();
+function askLine(kind){
+  const h = maybeHonor();
   const bank = {
     payment: [
-      `Cash or financing ang plan mo${h}?`,
-      `Para ma-ayos ko agad, cash ka ba or financing${h}?`,
-      `Noted. Payment mode mo${h} — cash or financing?`,
+      `Pwede tayo sa used cars either cash or hulugan${h}. Ano mas prefer mo?`,
+      `Cash or hulugan${h} tayo? Pareho ok—alin ang gusto mo?`,
+      `Pwede cash or financing${h}. Ano ang mas swak sa'yo?`,
     ],
     budget: [
-      `Magkano target budget mo${h}? (pwede ₱550k, 1.2m, etc.)`,
-      `Sige, budget range mo${h}?`,
-      `Para di ako lumampas, budget mo${h}?`,
+      `${ack()}—magkano target budget mo${h}? (puwede ₱550k, 1.2m, etc.)`,
+      `Para di ako lumampas, ano budget mo${h}?`,
+      `Sige${h}, budget range mo ilan?`,
     ],
     location: [
-      `Saan ka based${h}? (city/province lang ok)`,
-      `Taga saan ka${h}? QC, Pasig, Cavite?`,
-      `Para di ako mag-suggest ng malayo, anong area mo${h}?`,
+      `Nationwide inventory tayo. Saan location mo${h} para ma-match ko sa pinakamalapit na showroom?`,
+      `Nationwide kami—anong city/province mo${h} para malapit ang options?`,
+      `Saan ka based${h}? (city/province lang) Iha-hanap ko yung pinakamalapit na units.`,
     ],
     transmission: [
-      `Automatic or manual${h}? (pwede 'any')`,
-      `Trans preference${h} — AT, MT or any?`,
-      `Gusto mo automatic, manual, or ok lang kahit alin${h}?`,
+      `Marunong ka ba mag-manual${h} or automatic lang—or kahit ano ok?`,
+      `Transmission mo${h}—AT, MT, or ok lang kahit alin?`,
+      `Gusto mo automatic, manual, or any${h}?`,
     ],
     bodyType: [
-      `Body type${h}? sedan, SUV, MPV, van, pickup, hatchback, crossover (or ‘any’).`,
-      `Hanap mo${h} anong body type — sedan/SUV/MPV/van/pickup/hatch/crossover?`,
-      `May body type ka ba na prefer${h}, or ok lang any?`,
+      `5-seater or 7+ seater ba hanap mo${h}? Or van/pickup ok din?`,
+      `Body type mo${h}—5-seater, 7-seater/MPV/SUV, or van/pickup?`,
+      `May prefer ka ba—sedan, SUV/MPV (7+), van, pickup—or ok lang any${h}?`,
     ]
   };
   return pick(bank[kind] || ['']);
 }
 
-function needPhase1(qual) {
-  return !(qual?.payment && qual?.budget && qual?.location && qual?.transmission && qual?.bodyType);
+function needPhase1(q){
+  return !(q?.payment && q?.budget && q?.location && q?.transmission && q?.bodyType);
 }
-
-function nextMissingKey(qual) {
-  if (!qual.payment) return 'payment';
-  if (!qual.budget) return 'budget';
-  if (!qual.location) return 'location';
-  if (!qual.transmission) return 'transmission';
-  if (!qual.bodyType) return 'bodyType';
+function nextMissingKey(q){
+  if (!q.payment) return 'payment';
+  if (!q.budget) return 'budget';
+  if (!q.location) return 'location';
+  if (!q.transmission) return 'transmission';
+  if (!q.bodyType) return 'bodyType';
   return null;
 }
-
-function askNextMissing(session) {
-  const key = nextMissingKey(session.qualifier || {});
+function askNextMissing(session){
+  const key = nextMissingKey(session.qualifier||{});
   if (!key) return null;
   if (!session._asked) session._asked = {};
-
-  // pick a line and avoid repeating the exact same phrase consecutively
   let line = askLine(key);
-  const last = session._asked[key];
-  if (last === line) line = askLine(key);
+  if (session._asked[key] === line) line = askLine(key); // avoid immediate repeat
   session._asked[key] = line;
   return line;
 }
 
-/* ========================= welcome / re-entry =========================== */
-function welcomeBlock(session) {
+/* -------------------- Welcome / re-entry -------------------- */
+function welcomeBlock(session){
   const firstTime = !session.createdAtTs || isStale(session.createdAtTs);
   if (firstTime) {
     return [{
@@ -97,12 +91,12 @@ function welcomeBlock(session) {
   }];
 }
 
-/* ============================== MAIN ROUTE ============================== */
+/* -------------------- Main route -------------------- */
 export async function route(session, userText, rawEvent) {
   const messages = [];
   const now = Date.now();
 
-  // bootstrap session
+  // bootstrap
   session.createdAtTs = session.createdAtTs || now;
   session.phase = session.phase || 'phase1';
   session.qualifier = session.qualifier || {};
@@ -110,7 +104,6 @@ export async function route(session, userText, rawEvent) {
 
   const payload = (rawEvent?.postback?.payload && String(rawEvent.postback.payload)) || '';
 
-  // quick controls
   if (/^start over$/i.test(payload)) {
     session.phase = 'phase1';
     session.qualifier = {};
@@ -118,30 +111,24 @@ export async function route(session, userText, rawEvent) {
     session._welcomed = false;
     session._asked = {};
   }
-  if (/^continue$/i.test(payload)) {
-    // keep current phase; no changes
-  }
 
-  /* --------------------------- Phase 1 --------------------------------- */
+  /* -------------------- Phase 1 -------------------- */
   if (session.phase === 'phase1') {
     if (!session._welcomed) {
       messages.push(...welcomeBlock(session));
       session._welcomed = true;
     }
 
-    // absorb any free text into qualifiers (Taglish, slang, model prefs)
-    if (userText) {
-      session.qualifier = Qualifier.absorb(session.qualifier, userText);
-    }
+    // absorb Taglish inputs; extracts multiple values in one message
+    if (userText) session.qualifier = Qualifier.absorb(session.qualifier, userText);
 
-    // ask only the next missing field, with human tone
     if (needPhase1(session.qualifier)) {
       const ask = askNextMissing(session);
       if (ask) messages.push({ type: 'text', text: ask });
       return { session, messages };
     }
 
-    // all qualifiers complete → natural preface before Phase 2
+    // Natural preface → Phase 2
     const sum = Qualifier.summary(session.qualifier);
     messages.push({
       type: 'text',
@@ -151,28 +138,20 @@ export async function route(session, userText, rawEvent) {
         `Saglit, I’ll pull the best units that fit this. 🔎`,
     });
 
-    // hand over to Phase 2
     session.phase = 'phase2';
   }
 
-  /* --------------------------- Phase 2 --------------------------------- */
+  /* -------------------- Phase 2 -------------------- */
   if (session.phase === 'phase2') {
     const step = await Offers.step(session, userText, rawEvent);
     messages.push(...step.messages);
     session = step.session;
-
-    // move to Phase 3 when user chooses or decides payment path
-    if (session.nextPhase === 'cash') {
-      session.phase = 'cash';
-    } else if (session.nextPhase === 'financing') {
-      session.phase = 'financing';
-    } else {
-      // still browsing offers
-      return { session, messages };
-    }
+    if (session.nextPhase === 'cash') session.phase = 'cash';
+    else if (session.nextPhase === 'financing') session.phase = 'financing';
+    else return { session, messages };
   }
 
-  /* ------------------------ Phase 3A: Cash ----------------------------- */
+  /* -------------------- Phase 3 (Cash) -------------------- */
   if (session.phase === 'cash') {
     const step = await CashFlow.step(session, userText, rawEvent);
     messages.push(...step.messages);
@@ -180,7 +159,7 @@ export async function route(session, userText, rawEvent) {
     return { session, messages };
   }
 
-  /* --------------------- Phase 3B: Financing --------------------------- */
+  /* -------------------- Phase 3 (Financing) -------------------- */
   if (session.phase === 'financing') {
     const step = await FinancingFlow.step(session, userText, rawEvent);
     messages.push(...step.messages);
@@ -188,16 +167,12 @@ export async function route(session, userText, rawEvent) {
     return { session, messages };
   }
 
-  /* ----------------------------- Fallback ------------------------------ */
-  messages.push({
-    type: 'text',
-    text: 'Sige, tuloy lang tayo. Cash or financing ang plan mo para ma-match ko properly?',
-  });
+  messages.push({ type: 'text', text: 'Sige, tuloy lang tayo. Cash or financing ang plan mo para ma-match ko properly?' });
   session.phase = 'phase1';
   return { session, messages };
 }
 
-/* -------- Optional shim: keep compatibility if code expects handleMessage --- */
+/* --- shim for older callers --- */
 export async function handleMessage({ psid, text, raw }) {
   if (!globalThis.__SESS) globalThis.__SESS = new Map();
   const sess = globalThis.__SESS.get(psid) ?? { psid };
