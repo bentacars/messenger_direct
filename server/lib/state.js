@@ -1,85 +1,26 @@
-// api/lib/state.js
-const SESS = new Map(); // psid -> state
-
-const newSession = () => ({
-  createdAt: Date.now(),
-  updatedAt: Date.now(),
-  lastUserAt: 0,
-
-  phase: 'p1',
-
-  slots: {
-    plan: null, budget: null, location: null, transmission: null, body_type: null,
-    brand_pref: null, model_pref: null, year_pref: null, variant_pref: null
-  },
-
-  lastAsked: null,
-  lastPromptAt: 0,
-
-  isWelcomed: false,
-  isReturning: false,
-
-  // picks/chosen set in Offers
-  picks: null,
-  chosen: null,
-
-  // Phase 3
-  schedule: null,
-  contact: null,
-  fin: null,
-  docs: null,
-  _docsAsked: false,
-  _addrShown: false,
-  _finLinesShown: false,
-
-  // Nudges state
-  nudges: {
-    p1: { lastAt: 0, count: 0 },
-    docs: { lastAt: 0, count: 0 }
-  }
-});
-
-export function getSession(psid) {
-  let s = SESS.get(psid);
-  const now = Date.now();
-  if (!s) {
-    s = newSession(); SESS.set(psid, s);
-  } else if (now - s.updatedAt > 7*24*60*60*1000) {
-    s = newSession(); SESS.set(psid, s); // 7-day reset
-  }
+// server/lib/state.js
+export function initIfNeeded(s = {}) {
+  s.phase ||= 'qualifying';
+  s.pending ||= 'collect';
+  s.collected ||= { payment: !!s.payment, budget: !!s.budget, location: !!s.location, transmission: !!s.transmission, body: !!s.body };
   return s;
 }
-export function saveSession(psid, s) {
-  s.updatedAt = Date.now();
-  SESS.set(psid, s);
-}
-export function resetSession(psid) {
-  SESS.set(psid, newSession());
+
+export function applyExtraction(s, ex) {
+  const f = (k) => ex[k] && (s[k] = s[k] || (k === 'budget' ? Number(ex[k]) : String(ex[k]).toLowerCase()));
+  ['payment','budget','location','transmission','body','brand','model','variant','year'].forEach(f);
+  s.collected = {
+    payment: !!s.payment, budget: !!s.budget, location: !!s.location, transmission: !!s.transmission, body: !!s.body
+  };
+  return s;
 }
 
-// Activity
-export function markUserActivity(psid) {
-  const s = getSession(psid);
-  s.lastUserAt = Date.now();
-  saveSession(psid, s);
-}
-
-// Debounce same-slot prompts
-export function shouldDebounce(psid, slot) {
-  const s = getSession(psid);
-  const now = Date.now();
-  if (s.lastAsked === slot && (now - s.lastPromptAt) < 1500) return true;
-  s.lastAsked = slot;
-  s.lastPromptAt = now;
-  saveSession(psid, s);
-  return false;
-}
-
-// For cron nudger
-export function getAllSessions() {
-  const arr = [];
-  for (const [psid, session] of SESS.entries()) {
-    arr.push({ psid, session });
-  }
-  return arr;
+export function missingFields(s) {
+  const need = [];
+  if (!s.payment) need.push('payment');
+  if (!s.budget) need.push('budget');
+  if (!s.location) need.push('location');
+  if (!s.transmission) need.push('transmission');
+  if (!s.body) need.push('body');
+  return need;
 }
