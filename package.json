@@ -1,9 +1,10 @@
 {
-  "name": "bentacars-messenger-ai",
+  "name": "messenger-direct",
   "version": "1.0.0",
+  "private": true,
   "type": "module",
   "engines": { "node": ">=18" },
   "dependencies": {
-    "openai": "^4.58.0"
+    "openai": "^4.67.0"
   }
 }
