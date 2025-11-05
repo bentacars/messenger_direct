@@ -1,65 +1,48 @@
 // server/lib/messenger.js
-const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
+const PAGE_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 
-async function fbSend(psid, payload) {
-  const url = `https://graph.facebook.com/v18.0/me/messages?access_token=${encodeURIComponent(PAGE_ACCESS_TOKEN)}`;
-  const res = await fetch(url, {
+async function call(path, body) {
+  const url = `https://graph.facebook.com/v19.0/me/${path}?access_token=${PAGE_TOKEN}`;
+  const rsp = await fetch(url, {
     method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ recipient: { id: psid }, message: payload }),
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
   });
-  if (!res.ok) {
-    const t = await res.text();
-    console.error('FB send error', res.status, t);
+  if (!rsp.ok) {
+    const t = await rsp.text();
+    console.error('[FB API error]', t);
   }
 }
 
-export async function sendTypingOn(psid) {
-  const url = `https://graph.facebook.com/v18.0/me/messages?access_token=${encodeURIComponent(PAGE_ACCESS_TOKEN)}`;
-  await fetch(url, {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ recipient: { id: psid }, sender_action: 'typing_on' }),
+export async function sendText(psid, text, quick = null) {
+  const message = { text };
+  if (quick && quick.length) {
+    message.quick_replies = quick.map((title) => ({ content_type: 'text', title, payload: title }));
+  }
+  await call('messages', { recipient: { id: psid }, messaging_type: 'RESPONSE', message });
+}
+
+export async function sendButtons(psid, text, buttons = []) {
+  const payload = {
+    template_type: 'button',
+    text,
+    buttons: buttons.map((b) => ({ type: 'postback', title: b.title, payload: b.payload || b.title }))
+  };
+  await call('messages', {
+    recipient: { id: psid },
+    messaging_type: 'RESPONSE',
+    message: { attachment: { type: 'template', payload } }
   });
 }
-export async function sendTypingOff(psid) {
-  const url = `https://graph.facebook.com/v18.0/me/messages?access_token=${encodeURIComponent(PAGE_ACCESS_TOKEN)}`;
-  await fetch(url, {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ recipient: { id: psid }, sender_action: 'typing_off' }),
-  });
+
+export async function sendImages(psid, urls = []) {
+  for (const u of urls) {
+    await call('messages', {
+      recipient: { id: psid },
+      message: { attachment: { type: 'image', payload: { url: u, is_reusable: false } } }
+    });
+  }
 }
 
-export async function sendText(psid, text) { return fbSend(psid, { text }); }
-
-export async function sendQuick(psid, text, buttons) {
-  const quick_replies = buttons.map(b => ({
-    content_type: 'text',
-    title: b.title.slice(0,20),
-    payload: b.payload || b.title.toLowerCase()
-  }));
-  return fbSend(psid, { text, quick_replies });
-}
-
-export async function sendImage(psid, url) {
-  return fbSend(psid, { attachment: { type: 'image', payload: { url, is_reusable: false } } });
-}
-
-// Generic Template carousel (if supported)
-export async function sendCarousel(psid, items) {
-  return fbSend(psid, {
-    attachment: {
-      type: 'template',
-      payload: {
-        template_type: 'generic',
-        elements: items.slice(0,10).map(x => ({
-          title: x.title?.slice(0,80) || 'Photo',
-          image_url: x.image_url,
-          subtitle: x.subtitle?.slice(0,80) || '',
-          buttons: x.buttons || []
-        }))
-      }
-    }
-  });
-}
+export async function sendTypingOn(psid) { await call('messages', { recipient: { id: psid }, sender_action: 'typing_on' }); }
+export async function sendTypingOff(psid) { await call('messages', { recipient: { id: psid }, sender_action: 'typing_off' }); }
