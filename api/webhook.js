@@ -34,24 +34,27 @@ export default async function handler(req, res) {
         if (!psid) continue;
 
         const text = evt.message?.text || evt.postback?.payload || "";
-        const session = await getSession(psid);
+        let session = await getSession(psid);
 
         await sendTypingOn(psid);
         resetNudge(session);
 
-        // Handle interrupts (FAQ etc.)
-        const intr = await handleInterrupts(text, session);
-        if (intr) {
-          await sendMessage(psid, intr.reply);
-          if (intr.resume) await sendMessage(psid, intr.resume);
-          await setSession(psid, session);
-          await sendTypingOff(psid);
-          continue;
+        // Interrupts (FAQ/objections)
+        if (text) {
+          const intr = await handleInterrupts(text, session);
+          if (intr) {
+            await sendMessage(psid, intr.reply);
+            if (intr.resume) await sendMessage(psid, intr.resume);
+            await setSession(psid, session);
+            await sendTypingOff(psid);
+            continue;
+          }
         }
 
-        // Main flow
+        // Main LLM flow
         const { messages, nextSession } = await route({ session, text, evt });
         for (const msg of messages) await sendMessage(psid, msg);
+
         await checkNudge(nextSession, (t) => sendMessage(psid, t));
         await setSession(psid, nextSession);
         await sendTypingOff(psid);
@@ -61,6 +64,6 @@ export default async function handler(req, res) {
     res.status(200).json({ ok: true });
   } catch (err) {
     console.error("webhook fatal", err);
-    res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 }
