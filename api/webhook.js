@@ -1,12 +1,10 @@
-// /api/webhook.js
 export const config = { runtime: "nodejs" };
 
-import { sendTypingOn, sendTypingOff, sendMessages, getFirstName } from "../server/lib/messenger.js";
+import { sendTypingOn, sendTypingOff } from "../server/lib/messenger.js";
 import * as Router from "../server/flows/router.js";
 
 const FB_VERIFY_TOKEN = process.env.FB_VERIFY_TOKEN || "";
 
-/* -------------------- GET: Verification -------------------- */
 export default async function handler(req, res) {
   try {
     if (req.method === "GET") {
@@ -31,37 +29,33 @@ export default async function handler(req, res) {
     for (const entry of body.entry) {
       const messaging = entry.messaging || [];
       for (const evt of messaging) {
-        const psid = evt?.sender?.id;
+        const psid = evt.sender && evt.sender.id;
         if (!psid) continue;
 
-        // extract text or postback
         const text =
           (evt.message && evt.message.text) ||
-          (evt.postback && (evt.postback.title || evt.postback.payload)) ||
+          (evt.postback && evt.postback.title) ||
           "";
 
         const attachments =
           (evt.message && evt.message.attachments) ||
-          (evt.postback && evt.postback.payload && JSON.parse(evt.postback.payload)?.attachments) ||
           [];
-
-        // optional first name
-        const firstName = await getFirstName(psid).catch(() => "");
 
         await sendTypingOn(psid);
         try {
-          const messages = await Router.handleMessage({
-            psid,
-            text,
-            raw: evt,
-            attachments,
-            postback: evt.postback || null,
-            firstName
-          });
-          await sendMessages(psid, messages);
+          if (Router && typeof Router.handleMessage === "function") {
+            await Router.handleMessage({
+              psid,
+              text,
+              raw: evt,
+              attachments,
+              postback: evt.postback || null
+            });
+          } else {
+            console.error("Router.handleMessage not found");
+          }
         } catch (err) {
           console.error("route/send error", err);
-          await sendMessages(psid, [{ type: "text", text: "Oops—nagka-issue saglit. Try uli in a bit? 🙏" }]);
         } finally {
           await sendTypingOff(psid);
         }
