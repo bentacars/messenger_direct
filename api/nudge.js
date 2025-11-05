@@ -1,5 +1,5 @@
 // api/nudge.js
-export const config = { runtime: 'nodejs18.x' };
+export const config = { runtime: 'nodejs' };
 
 import { getSession, saveSession } from '../server/lib/session.js';
 import { aiNudge } from '../server/lib/llm.js';
