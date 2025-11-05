@@ -1,0 +1,9 @@
+{
+  "installCommand": "npm install --no-audit --no-fund",
+  "buildCommand": "",
+  "functions": {
+    "api/*": {
+      "runtime": "nodejs22.x"
+    }
+  }
+}
