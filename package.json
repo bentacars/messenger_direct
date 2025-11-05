@@ -1,11 +1,10 @@
 {
-  "name": "messenger-direct",
+  "name": "bentacars-ai-bot",
   "version": "1.0.0",
-  "private": true,
   "type": "module",
-  "engines": { "node": ">=18" },
   "dependencies": {
-    "openai": "^4.67.0",
+    "openai": "^4.13.0",
+    "@upstash/redis": "^1.23.4",
     "node-fetch": "^3.3.2"
   }
 }
