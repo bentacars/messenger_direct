@@ -1,259 +1,250 @@
-// Phase 2 — match up to 4 units (Priority → OK to Market), show 2 first,
-// "Others" reveals backup 2. When a unit is chosen, send photo CAROUSEL.
+// /server/flows/offers.js
+// Phase 2 — match up to 4 units (Priority → OK to Market), show 2 first, "Others" reveals backup,
+// and when a unit is chosen, send photo GALLERY (image_1..image_10) then move to next phase.
 
-import { sendText, sendButtons, sendImage, sendCarousel } from "../lib/messenger.js";
+import { strongWants, hasStrongWants } from './qualifier.js';
+import { sendText, sendButtons, sendImage, sendImagesCarousel } from '../lib/messenger.js';
+import { nlg } from '../lib/ai.js';
 
-const INVENTORY_API_URL = process.env.INVENTORY_API_URL || process.env.KV_REST_API_URL;
+const INVENTORY_API_URL = process.env.INVENTORY_API_URL || "";
 
-// --- helpers ---
-const toNum = (v) => {
-  const n = Number(String(v || "").replace(/[₱, ]/g, ""));
-  return isFinite(n) ? n : 0;
-};
+const PAGE_SIZE = 2;
 
-function qualWants(qual = {}) {
-  return {
-    payment: (qual.payment || "").toLowerCase(), // cash|financing
-    budget: toNum(qual.budget),
-    location: (qual.location || "").toLowerCase(),
-    trans: (qual.transmission || "").toLowerCase(), // at|mt|any
-    body: (qual.bodyType || "").toLowerCase(),
-    brand: (qual.brand || "").toLowerCase(),
-    model: (qual.model || "").toLowerCase(),
-    year: String(qual.year || "").toLowerCase(),
-    variant: (qual.variant || "").toLowerCase()
-  };
+function carHook(row) {
+  // ultra-simple hooks; can expand with a model→hook table later
+  const m = (row.model || "").toLowerCase();
+  if (/mirage/.test(m)) return "3-cyl → super tipid sa gas ✅";
+  if (/vios/.test(m)) return "Matipid, pang-grab, mura maintenance ✅";
+  if (/innova/.test(m)) return "7-seater, pang-pamilya, diesel tipid ✅";
+  return "Good condition, ready to view ✅";
 }
 
-function isPriority(row) {
-  const s = (row.price_status || "").toLowerCase();
-  return s.includes("priority");
-}
-function isOK(row) {
-  const s = (row.price_status || "").toLowerCase();
-  return s.includes("ok");
-}
-
-function withinCashBudget(row, budget) {
-  if (!budget) return true;
-  const srp = toNum(row.srp || row.dealer_price || 0);
-  return srp >= budget - 50000 && srp <= budget + 50000;
-}
-function withinFinBudget(row, budget) {
-  if (!budget) return true;
-  const allin = toNum(row.all_in || 0);
-  return allin <= budget + 50000;
-}
-
-function matchesStrong(row, w) {
-  if (w.brand && String(row.brand || "").toLowerCase() !== w.brand) return false;
-  if (w.model && String(row.model || "").toLowerCase() !== w.model) return false;
-  if (w.variant && !String(row.variant || "").toLowerCase().includes(w.variant)) return false;
-  if (w.year && String(row.year || "").toLowerCase() !== w.year) return false;
-  return true;
-}
-
-function matchesPhase1(row, w) {
-  // Transmission "any" means ignore, else check
-  if (w.trans && w.trans !== "any") {
-    const t = String(row.transmission || "").toLowerCase();
-    const wantAT = ["a/t", "at", "automatic"];
-    const wantMT = ["m/t", "mt", "manual"];
-    if (w.trans.startsWith("a") && !wantAT.some(s => t.includes(s))) return false;
-    if (w.trans.startsWith("m") && !wantMT.some(s => t.includes(s))) return false;
-  }
-  if (w.body && w.body !== "any") {
-    const b = String(row.body_type || row.bodyType || "").toLowerCase();
-    if (b && !b.includes(w.body)) return false;
-  }
-  return true;
-}
-
-function quickHook(row) {
-  const m = String(row.model || "").toLowerCase();
-  if (m.includes("vios")) return "Matipid, mura maintenance ✅";
-  if (m.includes("mirage")) return "3-cyl → super tipid sa gas ✅";
-  if (m.includes("innova")) return "7-seater, pang-pamilya ✅";
-  if (m.includes("everest")) return "Mataas ground clearance, malakas hatak ✅";
-  return "Good condition, ready for viewing ✅";
-}
-
-function imagesOf(row) {
-  const imgs = [];
+function pickPrimaryImage(row) {
   for (let i = 1; i <= 10; i++) {
-    const u = row[`image_${i}`];
-    if (u && /^https?:\/\//i.test(u)) imgs.push(u);
+    const key = `image_${i}`;
+    if (row[key]) return row[key];
   }
-  return imgs;
+  return null;
 }
 
-// Build pool (max 4) honoring Priority→OK and strong wants
-async function buildPool(qual) {
-  const w = qualWants(qual);
-
-  const res = await fetch(INVENTORY_API_URL);
-  const data = await res.json(); // expect array of rows with headers provided
-
-  const base = Array.isArray(data) ? data : (data?.rows || []);
-  const items = base.filter(Boolean);
-
-  const priced = items.filter(row => {
-    if (w.payment === "cash") return withinCashBudget(row, w.budget);
-    return withinFinBudget(row, w.budget);
-  }).filter(row => matchesPhase1(row, w));
-
-  const strong = priced.filter(r => matchesStrong(r, w));
-  const loose  = priced.filter(r => !matchesStrong(r, w));
-
-  function sortTier(list) {
-    const pri = list.filter(isPriority);
-    const ok  = list.filter(r => !isPriority(r) && isOK(r));
-    const rest = list.filter(r => !pri.includes(r) && !ok.includes(r));
-    return [...pri, ...ok, ...rest];
+function allImages(row) {
+  const images = [];
+  for (let i = 1; i <= 10; i++) {
+    const key = `image_${i}`;
+    if (row[key]) images.push(row[key]);
   }
-
-  const ordered = [...sortTier(strong), ...sortTier(loose)];
-  return ordered.slice(0, 4);
+  return images;
 }
 
-// Format single card text
-function unitLine(row, payment) {
-  const loc = [row.city, row.province || row.ncr_zone].filter(Boolean).join(", ");
-  const km = row.mileage ? `${row.mileage} km — ` : "";
-  if (payment === "cash") {
-    const srp = toNum(row.srp) || toNum(row.dealer_price);
-    return [
-      `${row.year || ""} ${row.brand || ""} ${row.model || ""} ${row.variant || ""}`.replace(/\s+/g, " ").trim(),
-      `${km}${loc}`,
-      `SRP: ₱${(srp || 0).toLocaleString()} (negotiable upon viewing)`,
-      quickHook(row)
-    ].join("\n");
-  } else {
-    const range = row.all_in ? `₱${toNum(row.all_in).toLocaleString()}` : "Ask all-in";
-    return [
-      `${row.year || ""} ${row.brand || ""} ${row.model || ""} ${row.variant || ""}`.replace(/\s+/g, " ").trim(),
-      `${km}${loc}`,
-      `All-in: ${range} (subject for approval)`,
-      "Standard 20–30% DP, may promo all-in ✅"
-    ].join("\n");
+async function fetchInventory() {
+  if (!INVENTORY_API_URL) return [];
+  try {
+    const res = await fetch(INVENTORY_API_URL, { method: 'GET' });
+    if (!res.ok) throw new Error(`Inventory HTTP ${res.status}`);
+    const data = await res.json();
+    // Expect array of rows with headers the user provided
+    return Array.isArray(data) ? data : (data?.rows || []);
+  } catch (err) {
+    console.error("fetchInventory error", err);
+    return [];
   }
 }
 
-function elementFor(row, idx) {
-  const title = `${row.year || ""} ${row.brand || ""} ${row.model || ""}`.replace(/\s+/g, " ").trim();
-  const subtitle = quickHook(row);
-  const img = imagesOf(row)[0] || row.image_1 || row.image_2;
-  return {
-    title: title || "Unit",
-    image_url: img || undefined,
-    subtitle,
-    buttons: [
-      { type: "postback", title: `Unit ${idx}`, payload: `CHOOSE_${idx}` }
-    ]
-  };
+function withinBudgetCash(row, budget) {
+  if (!budget) return true;
+  const srp = Number(row.srp || row.dealer_price || 0);
+  if (!srp) return false;
+  return Math.abs(srp - budget) <= 50000; // ±₱50k
 }
 
-export async function step(session, userText, rawEvent) {
+function withinBudgetFinancing(row, budget) {
+  if (!budget) return true;
+  const allIn = Number(row.all_in || 0);
+  if (!allIn) return false;
+  return allIn <= (budget + 50000);
+}
+
+function cityMatches(rowCity="", wantCity="") {
+  if (!wantCity) return true;
+  const a = (rowCity || "").toLowerCase();
+  const b = (wantCity || "").toLowerCase();
+  if (!a || !b) return true;
+  if (a.includes(b) || b.includes(a)) return true;
+  return false;
+}
+
+function buildTitle(row) {
+  // "2020 Toyota Vios XE A/T"
+  const year = row.year || "";
+  const brand = row.brand || "";
+  const model = row.model || "";
+  const variant = row.variant || "";
+  return [year, brand, model, variant].filter(Boolean).join(" ").trim();
+}
+
+function describeUnit(row, isCash) {
+  const loc = [row.city, row.province || row.ncr_zone || ""].filter(Boolean).join(", ");
+  const km = row.mileage ? `${row.mileage.toLocaleString()} km` : "";
+  const priceLine = isCash
+    ? `SRP: ₱${Number(row.srp || 0).toLocaleString()} (negotiable upon viewing)`
+    : `All-in: ₱${Number(row.all_in || 0).toLocaleString()} (subject for approval)`;
+  const body = [
+    buildTitle(row),
+    [km, loc].filter(Boolean).join(" — "),
+    priceLine,
+    carHook(row)
+  ].filter(Boolean).join("\n");
+  return body;
+}
+
+function filterPool(rows, qual) {
+  const wants = strongWants(qual);
+  const isCash = qual.payment === "cash";
+
+  // 1) priority first, then ok-to-market
+  const priority = rows.filter(r => (r.price_status || "").toLowerCase().includes("priority"));
+  const ok = rows.filter(r => (r.price_status || "").toLowerCase().includes("ok"));
+
+  function matchOne(r) {
+    // strong wants (if any)
+    if (hasStrongWants(wants)) {
+      if (wants.brand && String(r.brand || "").toLowerCase() !== wants.brand) return false;
+      if (wants.model && String(r.model || "").toLowerCase() !== wants.model) return false;
+      if (wants.year && String(r.year || "") !== wants.year) return false;
+      if (wants.variant && !String(r.variant || "").toUpperCase().includes(String(wants.variant).toUpperCase())) return false;
+    }
+    // phase-1 fields: body, trans, location, budget
+    if (qual.bodyType && qual.bodyType !== "any") {
+      if (String(r.body_type || "").toLowerCase() !== String(qual.bodyType).toLowerCase()) return false;
+    }
+    if (qual.transmission && qual.transmission !== "ANY") {
+      const want = qual.transmission === "AT" ? "automatic" : "manual";
+      const have = String(r.transmission || "").toLowerCase();
+      if (!have.includes(want)) return false;
+    }
+    if (!cityMatches(String(r.city || ""), String(qual.location || ""))) return false;
+
+    // budget logic
+    if (isCash) return withinBudgetCash(r, Number(qual.budget || 0));
+    return withinBudgetFinancing(r, Number(qual.budget || 0));
+  }
+
+  const p = priority.filter(matchOne);
+  const o = ok.filter(matchOne);
+  return [...p, ...o].slice(0, 8); // build a bigger shortlist first
+}
+
+export default async function step(session, userText, rawEvent) {
   const messages = [];
+  const qual = session.qualifier || {};
+  const isCash = qual.payment === "cash";
+
+  // --- state for paging/selection
   session.funnel = session.funnel || {};
-  session.offers = session.offers || { pool: [], page: 0 };
+  session._offers = session._offers || { page: 0, pool: [] };
 
-  const payload = (rawEvent?.postback?.payload || "").toString();
-  const wantMorePhotos =
-    /\b(more|photos|images|lahat|tingin|shots|gallery)\b/i.test(String(userText || ""));
+  // handle "Others" or choose
+  const payloadText = (rawEvent?.postback?.payload || "").toString();
+  const rawTxt = (userText || "").toLowerCase();
 
-  // Handle CHOOSE_X → send gallery (carousel if possible)
-  if (/^CHOOSE_\d+/.test(payload)) {
-    const idx = Number(payload.split("_")[1]) - 1;
-    const unit = session.offers.pool[idx];
-    if (!unit) {
-      messages.push({ type: "text", text: "Medyo nawala ‘yung item na ‘yon. Pwede pili ka ulit? 😊" });
+  if (/^CHOOSE_/.test(payloadText)) {
+    const sku = payloadText.replace(/^CHOOSE_/, "");
+    const chosen = session._offers.pool.find(x => String(x.SKU || x.sku) === sku);
+    if (!chosen) {
+      messages.push({ type: "text", text: "Nawala yung unit na ‘yon, pili ka muna sa list below or type “Others” para sa iba pa." });
       return { session, messages };
     }
 
-    messages.push({ type: "text", text: "Solid choice! 🔥 Sending full photos…" });
+    // Confirm + send gallery
+    const t = await nlg("Solid choice! 🔥 Sending full photos…", { persona: "friendly" });
+    messages.push({ type: "text", text: t });
 
-    const imgs = imagesOf(unit);
-    if (imgs.length >= 2) {
-      // build carousel elements from images
-      const elements = imgs.slice(0, 10).map((u, i) => ({
-        title: i === 0 ? "Front / Angle" : `Photo ${i + 1}`,
-        image_url: u
-      }));
-      messages.push({ type: "carousel", elements });
-    } else if (imgs.length === 1) {
-      messages.push({ type: "image", url: imgs[0] });
-    } else {
-      messages.push({ type: "text", text: "Walang uploaded gallery, pero pwede tayo mag viewing. 😊" });
+    const imgs = allImages(chosen);
+    if (imgs.length) {
+      if (typeof sendImagesCarousel === "function") {
+        // Messenger generic template carousel
+        messages.push({ type: "gallery", images: imgs });
+      } else {
+        for (const url of imgs) messages.push({ type: "image", url });
+      }
     }
 
-    // Next phase hint (router will switch)
-    session.nextPhase = (session.qualifier?.payment === "cash") ? "cash" : "financing";
+    // Decide next phase (cash/financing)
+    session.unit = { sku: String(chosen.SKU || ""), label: buildTitle(chosen), raw: chosen };
+    session.nextPhase = isCash ? "cash" : "financing";
     return { session, messages };
   }
 
-  // "Others" → next page
-  if (/^SHOW_OTHERS/.test(payload) || /^others$/i.test(String(userText || ""))) {
-    session.offers.page = (session.offers.page || 0) + 1;
+  if (/others/i.test(payloadText) || /\bothers\b/i.test(rawTxt)) {
+    session._offers.page = (session._offers.page || 0) + 1;
   }
 
-  // First time in phase2 → build pool
-  if (!session.offers.pool?.length) {
-    let pool = [];
-    try {
-      pool = await buildPool(session.qualifier || {});
-    } catch (e) {
-      messages.push({ type: "text", text: `⚠️ Nagka-issue sa inventory: ${e?.message || e}. Subukan natin ulit mamaya o bawasan natin ang filters.` });
-      return { session, messages };
-    }
+  // --- if first time building pool
+  if (!Array.isArray(session._offers.pool) || !session._offers.pool.length) {
+    const rows = await fetchInventory();
+    const pool = filterPool(rows, qual);
+    session._offers.pool = pool.slice(0, 4); // limit to 4 total
+    session._offers.page = 0;
 
     if (!pool.length) {
-      messages.push({ type: "text", text: "Walang exact match sa filters na ‘to. Pwede kitang i-tryhan ng alternatives — type mo “Others”. 🙂" });
+      const sorry = await nlg(
+        "Walang exact match sa filters na ’to. Pwede kitang i-tryhan ng alternatives—type mo “Others”.",
+        { persona: "friendly" }
+      );
+      messages.push({ type: "text", text: sorry });
       return { session, messages };
     }
-
-    session.offers.pool = pool.slice(0, 4);
-    session.offers.page = 0;
   }
 
-  // Show 2 per page
-  const start = (session.offers.page || 0) * 2;
-  const slice = session.offers.pool.slice(start, start + 2);
-  const payment = (session.qualifier?.payment || "").toLowerCase();
+  // --- summary line before offers (first show only)
+  if (!session._offers._summarized) {
+    const sum = [
+      isCash ? "Cash buyer" : "Financing",
+      qual.budget ? `Budget ~ ₱${Number(qual.budget).toLocaleString()}` : "",
+      qual.location ? `Location: ${qual.location}` : "",
+      qual.transmission ? `Trans: ${qual.transmission === "ANY" ? "Any" : qual.transmission}` : "",
+      qual.bodyType ? `Body: ${qual.bodyType}` : "",
+      qual.model ? `Pref: ${qual.model}` : ""
+    ].filter(Boolean).join("\n• ");
 
-  for (let i = 0; i < slice.length; i++) {
-    const row = slice[i];
-    const text = unitLine(row, payment);
-    const img = imagesOf(row)[0];
+    const txt = await nlg(
+      `Alright, ito’ng hahanapin ko for you:\n• ${sum}\nSaglit, I’ll pull the best units that fit this. 🔎`,
+      { persona: "friendly" }
+    );
+    messages.push({ type: "text", text: txt });
+    session._offers._summarized = true;
+  }
+
+  // --- page slice (2 first, 2 backup)
+  const start = (session._offers.page || 0) * PAGE_SIZE;
+  const slice = session._offers.pool.slice(start, start + PAGE_SIZE);
+
+  if (!slice.length) {
+    const widen = await nlg(
+      "Mukhang wala nang exact matches. Gusto mo bang i-widen ko yung search? Pwede kong taasan nang konti ang price range or ibang body type.",
+      { persona: "friendly" }
+    );
+    messages.push({
+      type: "buttons",
+      text: widen,
+      buttons: [{ title: "Widen search ✅", payload: "WIDEN" }, { title: "Keep as is ❌", payload: "KEEP" }]
+    });
+    return { session, messages };
+  }
+
+  for (const row of slice) {
+    const img = pickPrimaryImage(row);
+    const body = describeUnit(row, isCash);
     if (img) messages.push({ type: "image", url: img });
-    messages.push({ type: "text", text });
-  }
-
-  // Buttons row
-  const btns = [];
-  if (slice[0]) btns.push({ title: "Unit 1", payload: "CHOOSE_1" });
-  if (slice[1]) btns.push({ title: "Unit 2", payload: "CHOOSE_2" });
-
-  // If more exist, add Others
-  if (start + 2 < session.offers.pool.length) {
-    btns.push({ title: "Others", payload: "SHOW_OTHERS" });
-  }
-
-  messages.push({ type: "buttons", text: "Pili ka:", buttons: btns });
-
-  // If user typed “photos” on a specific unit name, we could enhance here later.
-  if (wantMorePhotos && slice[0]) {
-    // Send quick gallery for the first visible item
-    const imgs = imagesOf(slice[0]);
-    if (imgs.length >= 2) {
-      const elements = imgs.slice(0, 10).map((u, i) => ({ title: `Photo ${i + 1}`, image_url: u }));
-      messages.push({ type: "carousel", elements });
-    } else if (imgs[0]) {
-      messages.push({ type: "image", url: imgs[0] });
-    }
+    messages.push({
+      type: "buttons",
+      text: body,
+      buttons: [
+        { title: "Unit 1", payload: `CHOOSE_${row.SKU || row.sku}` },
+        { title: "Others", payload: "SHOW_OTHERS" }
+      ]
+    });
   }
 
   return { session, messages };
 }
-
-export default { step };
