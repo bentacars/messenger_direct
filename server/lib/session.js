@@ -1,55 +1,32 @@
-// server/lib/state.js
-// Simpler, safer KV wrapper (avoids circular and V1 issues)
+// server/lib/session.js
+// Uses Upstash Redis KV. Auto-JSON, per-PSID session keys.
 
-import fetch from 'node-fetch';
+import { Redis } from "@upstash/redis";
+import { SESSION_TTL_DAYS } from "./constants.js";
 
-const KV_URL = process.env.KV_REST_API_URL;
-const KV_TOKEN = process.env.KV_REST_API_TOKEN;
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
 
-if (!KV_URL || !KV_TOKEN) {
-  throw new Error('KV env vars missing');
-}
+const TTL_SECONDS = SESSION_TTL_DAYS * 24 * 60 * 60;
 
-const headers = {
-  Authorization: `Bearer ${KV_TOKEN}`,
-  'Content-Type': 'application/json',
-};
-
-function sk(psid) {
-  return `state:${psid}`;
-}
-
-// -------------- GET --------------
-export async function getState(psid) {
-  const key = sk(psid);
-  const r = await fetch(`${KV_URL}/get/${key}`, { headers });
-  if (!r.ok) return null;
-  const t = await r.text();
+export async function getSession(psid) {
+  const key = `session:${psid}`;
   try {
-    return t ? JSON.parse(t) : null;
-  } catch {
-    return null;
+    const data = await redis.get(key);
+    return data || { psid, createdAt: Date.now() };
+  } catch (e) {
+    console.error("[session] GET failed", e);
+    return { psid, createdAt: Date.now() };
   }
 }
 
-// -------------- SET / MERGE --------------
-export async function setState(psid, patch) {
-  const old = (await getState(psid)) || {};
-  const safe = JSON.parse(JSON.stringify(patch)); // avoid circular refs
-  const merged = { ...old, ...safe, updated_at: Date.now() };
-
-  await fetch(`${KV_URL}/set/${sk(psid)}`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(merged),
-  });
-  return merged;
-}
-
-// -------------- RESET --------------
-export async function resetState(psid) {
-  await fetch(`${KV_URL}/del/${sk(psid)}`, {
-    method: 'POST',
-    headers,
-  });
+export async function setSession(psid, data) {
+  const key = `session:${psid}`;
+  try {
+    await redis.set(key, data, { ex: TTL_SECONDS });
+  } catch (e) {
+    console.error("[session] SET failed", e);
+  }
 }
