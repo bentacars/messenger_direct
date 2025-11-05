@@ -1,157 +1,181 @@
-import { sameDayAllowed, captureScheduleFromText, summarizeProposed, needsSchedule } from '../lib/schedule.js';
-import { needsContact, missingContactField, tryCaptureMobile, tryCaptureName } from '../lib/contact.js';
-import { resolveAddressByChosen } from '../lib/address.js';
-import { ensureDocsStore, markDocsReceived, detectDocsFromAttachments } from '../lib/docs.js';
-import { sendText } from '../lib/messenger.js';
-import { cashLine, financingLine, monthlyLines } from '../lib/pricing.js';
+// /server/flows/financing.js
+// Phase 3B: Financing path (schedule → contact → income → docs → done)
 
-function incomeAsked(session) {
-  return Boolean(session.fin?.source);
-}
+export async function step(session, userText, rawEvent) {
+  const messages = [];
+  const payload = getPayload(rawEvent);
+  const t = String(userText || '').trim();
 
-function ensureFinStore(session) {
-  if (!session.fin) session.fin = { source: null, term: null };
-}
+  session.funnel = session.funnel || {};
+  session.funnel.fin = session.funnel.fin || {};
+  if (!session.finStep) session.finStep = 'schedule';
 
-export async function finEntry(psid, session) {
-  session.phase = 'p3_fin';
-
-  // Scheduling first
-  if (needsSchedule(session)) {
-    if (sameDayAllowed()) {
-      await sendText(psid, "Available ka ba today for quick unit viewing? If not, anong day/time ka pwede?");
+  // 1) Schedule (for appraisal / viewing)
+  if (session.finStep === 'schedule') {
+    if (t && !payload) {
+      session.funnel.fin.schedule = t;
+      session.finStep = 'contact';
     } else {
-      await sendText(psid, "Medyo late na for same-day viewing. What day/time works for you tomorrow (or next available day)?");
+      messages.push({
+        type: 'buttons',
+        text: 'Kailan ka free for unit viewing (for appraisal)?',
+        buttons: [
+          { title: 'Today', payload: 'VIEW_TODAY' },
+          { title: 'Tomorrow', payload: 'VIEW_TOMORROW' },
+          { title: 'Pick a date', payload: 'VIEW_PICK' },
+        ],
+      });
+      if (payload === 'VIEW_TODAY') {
+        session.funnel.fin.schedule = 'Today';
+        session.finStep = 'contact';
+      } else if (payload === 'VIEW_TOMORROW') {
+        session.funnel.fin.schedule = 'Tomorrow';
+        session.finStep = 'contact';
+      } else if (payload === 'VIEW_PICK') {
+        messages.push({ type: 'text', text: 'Type mo preferred date/time (e.g., “Nov 7 3PM”).' });
+      }
+      if (messages.length) return { session, messages };
     }
-    return;
   }
 
-  // Continue to contact step
-  await finContactStep(psid, session);
-}
-
-export async function finHandle(psid, session, userText, attachments) {
-  // Step 1: Schedule
-  if (needsSchedule(session)) {
-    if (captureScheduleFromText(session, userText)) {
-      await sendText(psid, summarizeProposed(session.schedule.when));
+  // 2) Contact number
+  if (session.finStep === 'contact') {
+    const phone = extractPhone(t);
+    if (phone) {
+      session.funnel.fin.phone = phone;
+      session.finStep = 'income';
     } else {
-      await sendText(psid, "Anong day at time ka pwede for viewing? (e.g., “Wed 3pm”, “Saturday morning”)");
-      return;
+      messages.push({ type: 'text', text: 'Contact number mo po? Ipapadala ko rin ang checklist. 📩' });
+      return { session, messages };
     }
   }
 
-  // Step 2: Contact gate
-  if (await finContactStep(psid, session)) return;
-
-  // Step 3: Income source + terms + computed lines
-  if (!incomeAsked(session)) {
-    await sendText(psid, "While I’m locking your slot — since financing, ano ang source of income mo? (Employed / Business / OFW / Seaman / Pension / Other)");
-    return;
-  }
-
-  // If income already asked, see if the user provided one now
-  const low = userText.toLowerCase();
-  ensureFinStore(session);
-  if (!session.fin.source) {
-    if (/employ|sahod|worker|job/.test(low)) session.fin.source = 'employed';
-    else if (/business|self\-?employed|negosyo/.test(low)) session.fin.source = 'business';
-    else if (/ofw|seaman|seafarer/.test(low)) session.fin.source = 'ofw/seaman';
-    else if (/pension/.test(low)) session.fin.source = 'pension';
-    else if (/other|iba/.test(low)) session.fin.source = 'other';
-  }
-
-  // Show financing lines (all-in bracket + monthly)
-  if (!session._finLinesShown) {
-    const u = session?.chosen?.unit;
-    const lines = [
-      financingLine(u),
-      monthlyLines(u)
-    ].filter(Boolean).join('\n');
-    if (lines) await sendText(psid, `Estimated only:\n${lines}\nIlang years mo planong hulugan? (2, 3, or 4 years)`);
-    session._finLinesShown = true;
-    return;
-  }
-
-  // Capture preferred term
-  if (!session.fin.term) {
-    const n = Number((userText.match(/\b[234]\b/)||[])[0] || 0);
-    if (n) {
-      session.fin.term = n;
-    } else {
-      await sendText(psid, "Sige. Paki-indicate kung 2, 3, o 4 years yung preferred mo.");
-      return;
+  // 3) Income selection
+  if (session.finStep === 'income') {
+    // Payload choice or text
+    if (!payload && !/employ|self|ofw|seafarer/i.test(t)) {
+      messages.push({
+        type: 'buttons',
+        text: 'Source of income?',
+        buttons: [
+          { title: 'Employed', payload: 'INC_EMPLOYED' },
+          { title: 'Self-employed', payload: 'INC_SELF' },
+          { title: 'OFW/Seafarer', payload: 'INC_OFW' },
+        ],
+      });
+      return { session, messages };
     }
+
+    let kind = '';
+    if (payload === 'INC_EMPLOYED' || /employ/i.test(t)) kind = 'employed';
+    else if (payload === 'INC_SELF' || /self/i.test(t)) kind = 'self';
+    else if (payload === 'INC_OFW' || /ofw|seafarer/i.test(t)) kind = 'ofw';
+    else kind = 'employed';
+
+    session.funnel.fin.income = kind;
+    session.finStep = 'docs';
   }
 
-  // Ask docs based on source
-  ensureFinStore(session);
-  ensureDocsStore(session);
+  // 4) Docs checklist per income type
+  if (session.finStep === 'docs') {
+    const inc = session.funnel.fin.income || 'employed';
+    const req = getChecklist(inc);
+    session.funnel.fin.requiredDocs = req;
 
-  if (!session._docsAsked) {
-    switch (session.fin.source) {
-      case 'employed':
-        await sendText(psid, "Employed — may ready ka bang COE or latest payslip? Pwede mong i-send dito (photo or PDF).");
-        break;
-      case 'business':
-        await sendText(psid, "Business — may DTI/Mayor’s Permit ka? Send mo kasama ng latest income proof (bank statement or receipts).");
-        break;
-      case 'ofw/seaman':
-        await sendText(psid, "OFW/Seaman — ikaw ba mismo o receiver ng remittance? Valid ID + contract or remittance slip will help. Send mo dito.");
-        break;
-      case 'pension':
-        await sendText(psid, "Pension — send mo valid ID + latest pension proof. Photo/PDF ok.");
-        break;
-      default:
-        await sendText(psid, "Send mo muna any valid ID + proof of income (photo/PDF). We can pre-approve after checking.");
-        break;
-    }
-    session._docsAsked = true;
-    return;
+    messages.push({
+      type: 'text',
+      text:
+`Okay. ✅ Since you’re **${labelIncome(inc)}**, here’s the usual checklist:
+${req.map((x, i) => `${i + 1}. ${x}`).join('\n')}
+
+Pwede mong i-upload dito or reply “Send later” para i-follow up ko.`
+    });
+
+    // quick replies for convenience
+    messages.push({
+      type: 'quick_replies',
+      text: 'Ready ka na ba mag-upload?',
+      replies: [
+        { title: 'I’ll send later', payload: 'DOCS_LATER' },
+        { title: 'I’ll upload here', payload: 'DOCS_UPLOAD' },
+      ],
+    });
+
+    session.finStep = 'done';
+    return { session, messages };
   }
 
-  // Detect docs from attachments (image/file)
-  if (detectDocsFromAttachments(attachments)) {
-    markDocsReceived(session);
-    await sendText(psid, "Got it ✅ Reviewing now. Expect a call so we can fast-track approval.");
-    session.phase = 'done_fin';
-    return;
-  }
-
-  // If still nothing, gently remind
-  await sendText(psid, "Sige lang, send mo lang yung basic docs dito pag ready ka na. 👍");
+  // 5) Done / Summary
+  const sum = summarizeFin(session);
+  messages.push({ type: 'text', text: `All set. ✅ ${sum}\nHintayin mo ang follow-up for requirements & approval timeline.` });
+  return { session, messages };
 }
 
-async function finContactStep(psid, session) {
-  if (needsContact(session)) {
-    const missing = missingContactField(session);
-    if (missing === 'mobile') {
-      await sendText(psid, "Para ma-lock ko yung schedule, paki-send ng mobile number mo (PH format).");
-      return true;
-    }
-    if (missing === 'fullname') {
-      await sendText(psid, "Noted. Paki-send ng full name mo rin (first & last).");
-      return true;
-    }
-  }
-
-  // Reveal unit address after contact
-  const addr = await resolveAddressByChosen(session);
-  if (addr && !session._addrShown) {
-    await sendText(psid, `Complete address of the unit:\n${addr}\n\nSee you on your schedule! If may changes, message mo lang ako.`);
-    session._addrShown = true;
-  }
-  return false;
+/* ---------------- helpers ---------------- */
+function getPayload(evt) {
+  const p = evt?.postback?.payload;
+  return typeof p === 'string' ? p : '';
 }
 
-// Guard if user asks address too early
-export async function finAddressGate(psid) {
-  await sendText(psid, "Ibibigay ko ang full address once ma-lock natin ang viewing schedule + contact details mo. Para ma-prepare yung unit at ma-assist ka ng team.");
+function extractPhone(s = '') {
+  const m = s.replace(/\s+/g, '').match(/(\+?63|0)9\d{9}/);
+  return m ? normalizePH(m[0]) : '';
 }
 
-// Attempt to capture contact from free text
-export function finTryCaptureContact(session, userText) {
-  if (!session?.contact?.mobile && tryCaptureMobile(session, userText)) return 'mobile';
-  if (session?.contact?.mobile && !session?.contact?.fullname && tryCaptureName(session, userText)) return 'fullname';
-  return null;
+function normalizePH(p = '') {
+  let x = p.replace(/\D/g, '');
+  if (x.startsWith('09')) return '+63' + x.slice(1);
+  if (x.startsWith('9') && x.length === 10) return '+63' + x;
+  if (x.startsWith('63') && x.length === 12) return '+' + x;
+  if (x.startsWith('+63') && x.length === 13) return x;
+  return p;
+}
+
+function getChecklist(kind) {
+  switch (kind) {
+    case 'employed':
+      return [
+        'Valid IDs (2 government IDs)',
+        'COE (with salary) or Latest Contract',
+        'Payslips (last 3 months)',
+        'Proof of billing (address)',
+        'Bank statement (3–6 months, if available)',
+      ];
+    case 'self':
+      return [
+        'Valid IDs (2 government IDs)',
+        'DTI/SEC & Mayor’s Permit',
+        'Latest ITR / Audited FS (if any)',
+        'Bank statement (6 months)',
+        'Proof of billing (business/home)',
+      ];
+    case 'ofw':
+      return [
+        'Valid IDs (2 government IDs)',
+        'Passport & Seaman’s Book (if seafarer)',
+        'OEC/Contract/POEA docs',
+        'Proof of remittance (3–6 months)',
+        'Proof of billing (home)',
+      ];
+    default:
+      return ['Valid IDs', 'Proof of income', 'Proof of billing'];
+  }
+}
+
+function labelIncome(k) {
+  if (k === 'employed') return 'Employed';
+  if (k === 'self') return 'Self-employed';
+  if (k === 'ofw') return 'OFW/Seafarer';
+  return 'Applicant';
+}
+
+function summarizeFin(session) {
+  const unit = session?.funnel?.unit?.label || 'Selected unit';
+  const fin = session?.funnel?.fin || {};
+  const parts = [];
+  if (fin.schedule) parts.push(`Viewing: ${fin.schedule}`);
+  if (fin.phone) parts.push(`Contact: ${fin.phone}`);
+  if (fin.income) parts.push(`Income: ${labelIncome(fin.income)}`);
+  if (Array.isArray(fin.requiredDocs)) parts.push(`Docs: ${fin.requiredDocs.length} items`);
+  return `${unit}. ${parts.join(' • ')}`;
 }
