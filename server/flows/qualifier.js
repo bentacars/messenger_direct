@@ -1,192 +1,148 @@
 // /server/flows/qualifier.js
-// Conversational qualifier parser (Taglish). Exports: absorb(), summary()
+// Phase 1: absorb free-order qualifiers in a conversational way.
 
-/* ---------------- utils ---------------- */
-const norm = (s) => String(s || '').trim();
-const lower = (s) => norm(s).toLowerCase();
+const BOOL = (v) => !!v;
 
-function parseNumberPeso(txt) {
-  // accepts: "550k", "1.2m", "₱485,000", "below 100k", "under 80k", "500-600k"
-  const t = lower(txt).replace(/[₱,]/g, '').replace(/\s+/g, ' ').trim();
+const CLEAN = (s='') => s
+  .normalize('NFKC')
+  .replace(/\s+/g,' ')
+  .trim();
 
-  // range: choose midpoint
-  const range = t.match(/(\d+(\.\d+)?)(k|m)?\s*[-–]\s*(\d+(\.\d+)?)(k|m)?/);
-  if (range) {
-    const a = toPeso(range[1], range[3]);
-    const b = toPeso(range[4], range[6]);
-    return Math.round((a + b) / 2);
-  }
-
-  // below/under
-  const below = t.match(/(below|under|less\s*than|hanggang)\s*(\d+(\.\d+)?)(k|m)?/);
-  if (below) return toPeso(below[2], below[4]);
-
-  // plain single number
-  const one = t.match(/(\d+(\.\d+)?)(k|m)?/);
-  if (one) return toPeso(one[1], one[3]);
-
+function parseBudget(text='') {
+  const t = text.replace(/[,₱]/g,'');
+  // "550k", "550 K", "550,000", "100k all-in"
+  const m1 = t.match(/(\d{2,3})\s*[kK]\b/);
+  if (m1) return Number(m1[1]) * 1000;
+  const m2 = t.match(/\b(\d{5,7})\b/);
+  if (m2) return Number(m2[1]);
   return null;
-
-  function toPeso(numStr, suffix) {
-    let n = parseFloat(numStr);
-    const s = (suffix || '').toLowerCase();
-    if (s === 'k') n *= 1_000;
-    else if (s === 'm') n *= 1_000_000;
-    return Math.round(n);
-  }
 }
 
-function normalizeLocation(txt) {
-  const t = lower(txt);
-  if (!t) return '';
-  // very light mapping
-  if (/\bqc\b|\bquezon\s*city\b/.test(t)) return 'Quezon City';
-  if (/\bmakati\b/.test(t)) return 'Makati';
-  if (/\bpasig\b/.test(t)) return 'Pasig';
-  if (/\bmandaluyong\b/.test(t)) return 'Mandaluyong';
-  if (/\bmanila\b/.test(t)) return 'Manila';
-  if (/\bcavite\b/.test(t)) return 'Cavite';
-  if (/\blaguna\b/.test(t)) return 'Laguna';
-  if (/\bbulacan\b/.test(t)) return 'Bulacan';
-  if (/\bpampanga\b/.test(t)) return 'Pampanga';
-  if (/\bcebu\b/.test(t)) return 'Cebu';
-  if (/\bdavao\b/.test(t)) return 'Davao';
-  // first word fallback (city/province-like)
-  const m = t.match(/\b([a-zñ\- ]{2,20})\b/);
-  return m ? m[1].replace(/\b\w/g, c => c.toUpperCase()) : '';
+function parsePayment(text='') {
+  const t = text.toLowerCase();
+  if (/(cash|spot\s*cash|full\s*payment)/.test(t)) return "cash";
+  if (/(hulog|hulugan|financ|installment|all[-\s]*in)/.test(t)) return "financing";
+  return null;
 }
 
-function pickTransmission(t) {
-  if (/\b(at|automatic|auto)\b/.test(t)) return 'automatic';
-  if (/\b(mt|manual)\b/.test(t)) return 'manual';
-  if (/\b(any|kahit\s*ano)\b/.test(t)) return 'any';
-  return '';
+function parseLocation(text='') {
+  const m = text.match(/\b([a-zñ\s]+)\b/iu);
+  if (!m) return null;
+  let loc = CLEAN(m[1]);
+  // map shorthand
+  if (/^qc$/i.test(loc)) loc = "Quezon City";
+  if (/^mm$|^ncr$/i.test(loc)) loc = "Metro Manila";
+  return loc;
 }
 
-function pickBodyType(t) {
-  if (/\bsedan\b/.test(t)) return 'sedan';
-  if (/\b(suv|crossover)\b/.test(t)) return 'suv';
-  if (/\bmpv\b|\b7\+?\s*seater\b|\bseven\b/.test(t)) return 'mpv';
-  if (/\bvan\b/.test(t)) return 'van';
-  if (/\bpick[\s-]?up\b/.test(t)) return 'pickup';
-  if (/\bhatch(back)?\b/.test(t)) return 'hatchback';
-  if (/\b(any|kahit\s*ano)\b/.test(t)) return 'any';
-  return '';
+function parseTransmission(text='') {
+  const t = text.toLowerCase();
+  if (/(^|\W)(at|a\/?t|automatic)\b/.test(t)) return "AT";
+  if (/(^|\W)(mt|m\/?t|manual)\b/.test(t)) return "MT";
+  if (/\b(any|kahit ano)\b/.test(t)) return "ANY";
+  return null;
 }
 
-function pickPayment(t) {
-  if (/\b(hulugan|installment|financ(e|ing)|loan|utang)\b/.test(t)) return 'financing';
-  if (/\b(spot\s*cash|straight|cash\s*basis|cash)\b/.test(t)) return 'cash';
-  return '';
+function parseBody(text='') {
+  const t = text.toLowerCase();
+  if (/\b(sedan)\b/.test(t)) return "sedan";
+  if (/\b(suv)\b/.test(t)) return "suv";
+  if (/\b(mp[vb])\b/.test(t)) return "mpv";
+  if (/\b(van)\b/.test(t)) return "van";
+  if (/\b(pick[ -]?up)\b/.test(t)) return "pickup";
+  if (/\b(hatch(back)?)\b/.test(t)) return "hatchback";
+  if (/\b(cross(over)?)\b/.test(t)) return "crossover";
+  if (/\b(any|kahit ano)\b/.test(t)) return "any";
+  // 5-seater vs 7+ seater cue
+  if (/\b7(\+| plus)?\b/.test(t)) return "mpv";
+  return null;
 }
 
-function parseBrandModelVariantYear(t) {
-  // very light heuristic to capture mentions like "mirage glx 2020", "vios xe", "honda city"
-  const brands = [
-    'toyota','mitsubishi','honda','nissan','hyundai','kia','suzuki','ford','chevrolet',
-    'isuzu','mazda','mg','geely','subaru','bmw','mercedes','audi','porsche','changan','gac'
-  ];
-  const bt = lower(t);
-
-  let brand = '';
-  for (const b of brands) {
-    if (new RegExp(`\\b${b}\\b`).test(bt)) { brand = capitalize(b); break; }
+function parseModelHints(text='') {
+  // Capture brand/model/year/variant hints
+  const year = (text.match(/\b(20[0-4]\d|19\d{2})\b/) || [])[0] || "";
+  // brand+model (simple heuristic)
+  const brands = ["toyota","mitsubishi","honda","nissan","ford","hyundai","kia","isuzu","suzuki","mazda","chevrolet","bmw","mercedes","audi","changan","geely","mg"];
+  const foundBrand = brands.find(b => new RegExp(`\\b${b}\\b`, "i").test(text));
+  const words = text.split(/\s+/);
+  let model = "";
+  if (foundBrand) {
+    // take next token as model if present
+    const idx = words.findIndex(w => new RegExp(`^${foundBrand}$`, "i").test(w));
+    if (idx >= 0 && words[idx+1]) model = words[idx+1].replace(/[,\.]/g,'');
+  } else {
+    // specific popular models
+    const popular = ["vios","mirage","city","civic","innova","fortuner","territory","raize","wigo","brv","xtrail","almera","accent","elantra"];
+    model = popular.find(m => new RegExp(`\\b${m}\\b`,"i").test(text)) || "";
   }
-
-  // model: the token after brand, or common PH models
-  const commonModels = [
-    'vios','mirage','city','civic','altis','innova','fortuner','everest','raize','wigo','brv','br-v',
-    'xtrail','almera','terra','expander','xpander','stargazer','safari','yaris','jazz','accent',
-    'elantra','picanto','rio','soluto','sportage','seltos','ertiga','jimny','swift'
-  ];
-  let model = '';
-  if (brand) {
-    const m = bt.match(new RegExp(`\\b${brand.toLowerCase()}\\s+([a-z0-9\\-]+)\\b`));
-    if (m) model = capitalize(m[1]);
-  }
-  if (!model) {
-    for (const m of commonModels) {
-      if (new RegExp(`\\b${m}\\b`).test(bt)) { model = capitalize(m); break; }
-    }
-  }
-
-  // variant
-  let variant = '';
-  const varMatch = bt.match(/\b(glx|gls|ge|ge-x|xe|e|g|g-at|g-mt|vx|rs|sport|trend|titanium|premium|xlt|hline|highline)\b/);
-  if (varMatch) variant = varMatch[1].toUpperCase();
-
-  // year
-  const y = bt.match(/\b(20\d{2}|19\d{2})\b/);
-  const year = y ? y[1] : '';
-
-  return { brand, model, variant, year };
-
-  function capitalize(s) { return s ? s.replace(/\b\w/g, c => c.toUpperCase()) : s; }
+  // variant: XE, E, GLX, GLS, etc
+  const variant = (text.match(/\b([A-Z]{1,3}X?|[A-Z]{1,3}T)\b/) || [])[1] || "";
+  return {
+    brand: foundBrand ? foundBrand.toLowerCase() : "",
+    model: model.toLowerCase(),
+    variant: variant,
+    year: year ? String(year) : ""
+  };
 }
 
-/* ---------------- core: absorb ---------------- */
-export function absorb(prev = {}, userText = '') {
-  const q = { ...(prev || {}) };
-  const t = lower(userText);
+export function absorb(prev = {}, userText = "") {
+  const text = CLEAN(userText || "");
 
-  // payment
-  if (!q.payment) {
-    const p = pickPayment(t);
-    if (p) q.payment = p;
+  const payment = parsePayment(text) || prev.payment || null;
+  const budget = parseBudget(text) || prev.budget || null;
+  const location = parseLocation(text) || prev.location || null;
+  const transmission = parseTransmission(text) || prev.transmission || null;
+  const bodyType = parseBody(text) || prev.bodyType || null;
+  const pref = parseModelHints(text);
+
+  const next = {
+    ...prev,
+    payment, budget, location, transmission, bodyType
+  };
+
+  // Store strong wants if specified
+  if (pref.brand || pref.model || pref.variant || pref.year) {
+    next.brand = pref.brand || prev.brand || null;
+    next.model = pref.model || prev.model || null;
+    next.variant = pref.variant || prev.variant || null;
+    next.year = pref.year || prev.year || null;
   }
-
-  // budget
-  if (!q.budget) {
-    const n = parseNumberPeso(t);
-    if (Number.isFinite(n) && n > 0) q.budget = n;
-  }
-
-  // location
-  if (!q.location) {
-    // “taga qc ako”, “from pasig”, “qc lang ako”
-    const locHint = t.match(/\b(qc|quezon\s*city|makati|pasig|mandaluyong|manila|cavite|laguna|bulacan|pampanga|cebu|davao)\b/);
-    if (locHint) q.location = normalizeLocation(locHint[0]);
-  }
-
-  // transmission
-  if (!q.transmission) {
-    const tr = pickTransmission(t);
-    if (tr) q.transmission = tr;
-  }
-
-  // body type
-  if (!q.bodyType) {
-    const bt = pickBodyType(t);
-    if (bt) q.bodyType = bt;
-    // heuristic: if user said "mirage"/"vios" and no body type, assume sedan/hatch appropriately
-    const cm = lower(q.model || '');
-    if (!q.bodyType && /mirage|wigo|swift|picanto|brio/.test(cm)) q.bodyType = 'hatchback';
-    if (!q.bodyType && /vios|city|civic|altis|elantra|yaris/.test(cm)) q.bodyType = 'sedan';
-  }
-
-  // preference: brand/model/year/variant
-  const pref = parseBrandModelVariantYear(t);
-  if (pref.brand && !q.brand) q.brand = pref.brand;
-  if (pref.model && !q.model) q.model = pref.model;
-  if (pref.variant && !q.variant) q.variant = pref.variant;
-  if (pref.year && !q.year) q.year = pref.year;
-
-  return q;
+  return next;
 }
 
-/* ---------------- summary for Phase 2 preface ---------------- */
-export function summary(q = {}) {
+export function shortAskForMissing(qual) {
+  if (!qual.payment) return "Pwede tayo sa used cars either cash or hulugan—alin ang mas okay sa’yo?";
+  if (!qual.budget)  return "Para hindi ako lumagpas, mga magkano ang target budget mo?";
+  if (!qual.location) return "Nationwide tayo—saan ka based para ma-match ko sa pinakamalapit?";
+  if (!qual.transmission) return "Automatic, manual, or ok lang kahit alin?";
+  if (!qual.bodyType)  return "5-seater or 7+ seater ang hanap mo? (sedan/SUV/MPV/van/pickup or any)";
+  return null;
+}
+
+export function needPhase1(qual) {
+  return !(qual?.payment && qual?.budget && qual?.location && qual?.transmission && qual?.bodyType);
+}
+
+export function summary(qual = {}) {
   const parts = [];
-  if (q.payment) parts.push(`Payment: ${cap(q.payment)}`);
-  if (q.budget) parts.push(`Budget: ₱${Number(q.budget).toLocaleString('en-PH')}`);
-  if (q.location) parts.push(`Location: ${q.location}`);
-  if (q.transmission) parts.push(`Trans: ${cap(q.transmission)}`);
-  if (q.bodyType) parts.push(`Body: ${cap(q.bodyType)}`);
-  const pref = [q.brand, q.model, q.variant, q.year].filter(Boolean).join(' ');
-  if (pref) parts.push(`Pref: ${pref}`);
-  return parts.join(' • ');
-
-  function cap(s){ return String(s).charAt(0).toUpperCase() + String(s).slice(1); }
+  if (qual.payment) parts.push(qual.payment === "cash" ? "Cash buyer" : "Financing");
+  if (qual.budget) parts.push(`Budget ~ ₱${Number(qual.budget).toLocaleString()}`);
+  if (qual.location) parts.push(`Location: ${qual.location}`);
+  if (qual.transmission) parts.push(`Trans: ${qual.transmission === "ANY" ? "Any" : (qual.transmission === "AT" ? "Automatic" : "Manual")}`);
+  if (qual.bodyType) parts.push(`Body: ${qual.bodyType[0].toUpperCase()+qual.bodyType.slice(1)}`);
+  if (qual.model) parts.push(`Pref: ${qual.model}`);
+  return parts.join("\n• ");
 }
 
-export default { absorb, summary };
+// Helpers for Phase 2
+export function strongWants(qual = {}) {
+  return {
+    brand: (qual.brand || '').trim(),
+    model: (qual.model || '').trim(),
+    year: qual.year ? String(qual.year).trim() : '',
+    variant: (qual.variant || '').trim(),
+  };
+}
+export function hasStrongWants(w = {}) {
+  return !!(w.brand || w.model || w.year || w.variant);
+}
