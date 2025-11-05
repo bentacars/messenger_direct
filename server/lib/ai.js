@@ -1,26 +1,21 @@
 // /server/lib/ai.js
-// LLM helpers: (1) strict JSON slot extractor  (2) natural, one-line question generator
+// GPT-5 tone for Phase-1 questions + strict extractor
 
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_BASE = process.env.OPENAI_BASE_URL || 'https://api.openai.com/v1';
 
-// Prefer your cheaper model envs if present; fall back safely.
 const EXTRACTOR_MODEL = process.env.EXTRACTOR_MODEL || process.env.MODEL_DEFAULT || 'gpt-4o-mini';
-const NLG_MODEL       = process.env.NLG_MODEL       || process.env.MODEL_TONE   || 'gpt-4o-mini';
+const NLG_MODEL       = process.env.NLG_MODEL       || process.env.MODEL_TONE   || 'gpt-5.1-mini';
 
-const TEMP_TONE = Number(process.env.TEMP_TONE ?? 0.75);
-const FREQ_PENALTY_TONE = Number(process.env.FREQ_PENALTY_TONE ?? 0.2);
-
-// Turn this on in Vercel to *visibly* mark LLM vs fallback in chat.
+const TEMP_TONE = Number(process.env.TEMP_TONE ?? 0.9);
+const FREQ_PENALTY_TONE = Number(process.env.FREQ_PENALTY_TONE ?? 0.1);
+const PRES_PENALTY_TONE = Number(process.env.PRES_PENALTY_TONE ?? 0.3);
 const DEBUG_LLM = String(process.env.DEBUG_LLM || '0') === '1';
 
-async function openaiChat({ model, temperature, messages, response_format, frequency_penalty }) {
-  if (!OPENAI_API_KEY) {
-    console.warn('[ai] OPENAI_API_KEY missing');
-    throw new Error('OPENAI_API_KEY missing');
-  }
-  const body = { model, temperature, messages, response_format, frequency_penalty };
-  if (DEBUG_LLM) console.log('[ai] chat', { model, temperature, hasRF: !!response_format });
+async function openaiChat({ model, temperature, messages, response_format, frequency_penalty, presence_penalty }) {
+  if (!OPENAI_API_KEY) throw new Error('OPENAI_API_KEY missing');
+  const body = { model, temperature, messages, response_format, frequency_penalty, presence_penalty };
+  if (DEBUG_LLM) console.log('[ai] chat', { model, temperature });
 
   const res = await fetch(`${OPENAI_BASE}/chat/completions`, {
     method: 'POST',
@@ -38,20 +33,18 @@ async function openaiChat({ model, temperature, messages, response_format, frequ
   return out;
 }
 
-/* ---------------- 1) Slot Extractor (strict JSON) ---------------- */
+/* ---------- 1) Extractor (strict JSON) ---------- */
 const EXTRACTOR_SYS = `
-You extract car-buying qualifiers from short, noisy Taglish messages.
-Return ONLY valid JSON with keys:
-payment (cash|financing|null), budget (number|null), budget_is_upper (boolean),
-location (string|null), transmission (automatic|manual|any|null),
-bodyType (sedan|suv|mpv|van|pickup|hatchback|crossover|any|null),
-brand (string|null), model (string|null), variant (string|null), year (string|null).
+Extract car-buying qualifiers from short Taglish. Return ONLY JSON keys:
+payment(cash|financing|null), budget(number|null), budget_is_upper(boolean),
+location(string|null), transmission(automatic|manual|any|null),
+bodyType(sedan|suv|mpv|van|pickup|hatchback|crossover|any|null),
+brand(string|null), model(string|null), variant(string|null), year(string|null).
 
-Mapping: hulugan/installment/loan/utang => financing; spot cash/straight/cash basis => cash.
-AT/auto => automatic; MT => manual; “kahit ano” => any. "QC" => "Quezon City".
-Budget: strip ₱ and commas; "below/under X" => budget=X, budget_is_upper=true;
-range "500-600k" => midpoint.
-Output JSON only.
+Map: hulugan/installment/loan/utang=>financing; spot cash/straight=>cash;
+AT/auto=>automatic; MT=>manual; "kahit ano"=>any; "QC"=>"Quezon City".
+Budget: strip ₱/commas; "below/under X"=> budget=X & budget_is_upper=true;
+"500-600k"=> midpoint. Output JSON only.
 `.trim();
 
 export async function extractSlotsLLM(userText) {
@@ -74,31 +67,26 @@ export async function extractSlotsLLM(userText) {
   }
 }
 
-/* ---------------- 2) NLG: one friendly question ---------------- */
+/* ---------- 2) NLG one-liner (GPT-5) ---------- */
 const NLG_SYS = `
-You write ONE short, human question in Taglish to collect ONE missing qualifier.
-Tone: warm, friendly PH sales agent; no checklist vibe; concise; avoid repeating the exact same wording as the previous line.
-If first_name is provided, greet by name and do NOT use sir/ma'am. Otherwise, light honorific is allowed but not required.
-
-Context:
-- known_fields = JSON of captured qualifiers
-- slot = payment|budget|location|transmission|bodyType
-- first_name = optional
-- avoid = the last exact line we asked (do not repeat it)
-
-Guidance:
-- When asking location, mention that inventory is nationwide.
-- One sentence (<=20 words). No bullets. No emojis unless the user used one.
-
+You write ONE short, natural Taglish question to collect ONE missing qualifier.
+Persona: warm PH car consultant—helps, mirrors the user's words, never robotic.
+Rules:
+- If first_name exists, address them by name; never use sir/ma'am.
+- Keep it one sentence, <= 18 words, no bullets.
+- No emojis unless the user used one earlier.
+- Vary phrasing from "avoid" exactly; do not repeat lines.
+- When asking location, mention we match from a nationwide inventory.
+Slots: payment | budget | location | transmission | bodyType.
 Return plain text only.
 `.trim();
 
 export async function nlgAskForSlot(slot, knownFields, firstName = '', avoidLine = '') {
   const user = [
-    `known_fields=${JSON.stringify(knownFields || {})}`,
     `slot=${slot}`,
     `first_name=${firstName || ''}`,
-    `avoid=${avoidLine || ''}`
+    `avoid=${avoidLine || ''}`,
+    `known_fields=${JSON.stringify(knownFields || {})}`
   ].join('\n');
 
   try {
@@ -106,6 +94,7 @@ export async function nlgAskForSlot(slot, knownFields, firstName = '', avoidLine
       model: NLG_MODEL,
       temperature: TEMP_TONE,
       frequency_penalty: FREQ_PENALTY_TONE,
+      presence_penalty: PRES_PENALTY_TONE,
       messages: [
         { role: 'system', content: NLG_SYS },
         { role: 'user', content: user }
@@ -115,13 +104,13 @@ export async function nlgAskForSlot(slot, knownFields, firstName = '', avoidLine
   } catch (e) {
     console.warn('[ai.nlg] fail:', e?.message || e);
     const f = {
-      payment: 'Pwede cash or hulugan. Ano mas prefer mo?',
-      budget: 'Para hindi ako lumampas, mga magkano budget mo?',
-      location: 'Nationwide tayo—saan ka based para mahanap ko yung pinakamalapit?',
-      transmission: 'Automatic, manual, or ok lang kahit alin?',
-      bodyType: '5-seater or 7+ seater? Or van/pickup ok din?'
+      payment: 'We can do cash or hulugan—alin ang mas okay sa’yo?',
+      budget: 'Para hindi ako lumagpas, mga magkano ang target budget mo?',
+      location: 'Nationwide tayo—saan ka nakabase para ma-match ko sa pinakamalapit?',
+      transmission: 'Automatic ba gusto mo, manual, o puwedeng kahit alin?',
+      bodyType: '5-seater or 7+ seater ang hanap mo? Van/pickup ok din kung gusto mo.'
     };
-    return f[slot] || 'Sige, tell me more?';
+    return f[slot] || 'Sige, share mo pa para ma-match ko nang tama.';
   }
 }
 
