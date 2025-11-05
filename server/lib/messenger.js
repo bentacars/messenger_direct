@@ -1,155 +1,52 @@
 // server/lib/messenger.js
-// Wrapper for Facebook Messenger Send API
-// Handles sending text, buttons, images, and routing to bot core
-// Ensures safe JSON/session/save (no circular structures)
+// FB Send API + Button/Carousel helpers
 
-import fetch from 'node-fetch';
-import { getState, setState, resetState } from './state.js';
+import fetch from "node-fetch";
+import { FB_GRAPH_API, FB_PAGE_TOKEN } from "./constants.js";
 
-const FB_PAGE_TOKEN = process.env.FB_PAGE_TOKEN;
-const FB_PROFILE_URL = `https://graph.facebook.com/v17.0/me/messages`;
-
-if (!FB_PAGE_TOKEN) {
-  console.warn('[messenger] Missing FB_PAGE_TOKEN');
-}
-
-/* ================= CORE SEND HELPERS ================= */
-
-async function fbSend(psid, payload) {
-  const res = await fetch(FB_PROFILE_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      recipient: { id: psid },
-      message: payload,
-      messaging_type: 'RESPONSE',
-      access_token: FB_PAGE_TOKEN,
-    }),
-  });
-
-  const text = await res.text().catch(() => '');
-  if (!res.ok) {
-    console.error('[fbSend]', res.status, text);
-  }
-}
-
-/** Send typing indicator */
-export async function sendTyping(psid, on = true) {
-  await fetch(FB_PROFILE_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      recipient: { id: psid },
-      sender_action: on ? 'typing_on' : 'typing_off',
-      access_token: FB_PAGE_TOKEN,
-    }),
-  });
-}
-
-/** Send plain text */
-export async function sendText(psid, text) {
-  await fbSend(psid, { text });
-}
-
-/** Send a button template */
-export async function sendButtons(psid, text, buttons) {
-  await fbSend(psid, {
-    attachment: {
-      type: 'template',
-      payload: {
-        template_type: 'button',
-        text,
-        buttons,
-      },
-    },
-  });
-}
-
-/** Send image(s) one by one */
-export async function sendImages(psid, urls = []) {
-  for (const u of urls) {
-    if (!u) continue;
-    await fbSend(psid, {
-      attachment: {
-        type: 'image',
-        payload: {
-          url: u,
-          is_reusable: true,
-        },
-      },
-    });
-  }
-}
-
-/* ===================== MAIN WEBHOOK DISPATCH ===================== */
-
-// Safely extract text from webhook event
-function extractText(evt) {
-  return (
-    (evt.message && evt.message.text) ||
-    (evt.postback && evt.postback.title) ||
-    ''
-  );
-}
-
-// Safely extract attachments
-function extractAttachments(evt) {
-  const at = evt?.message?.attachments;
-  return Array.isArray(at) ? at : [];
-}
-
-/**
- * handleWebhook
- * Called by api/webhook.js
- *  1) loads session
- *  2) sends to router
- *  3) dispatches router messages
- */
-export async function handleWebhook(psid, evt, routerFn) {
-  const userText = extractText(evt) || '';
-  const attachments = extractAttachments(evt);
-
-  const safeRaw = {
-    postback: evt.postback?.payload || null,
-    quick_reply: evt.message?.quick_reply?.payload || null,
+export async function sendMessage(psid, payload) {
+  const body = {
+    recipient: { id: psid },
+    message: typeof payload === "string" ? { text: payload } : payload,
   };
+  return callSendAPI(body);
+}
 
-  // ✅ Load existing state (or empty)
-  const st = (await getState(psid)) || {};
+export async function sendTypingOn(psid) {
+  return callSendAPI({ recipient: { id: psid }, sender_action: "typing_on" });
+}
+export async function sendTypingOff(psid) {
+  return callSendAPI({ recipient: { id: psid }, sender_action: "typing_off" });
+}
 
-  // ✅ Router does the logic (Phase 1 → 2 → 3 etc.)
-  const result = await routerFn({
-    psid,
-    text: userText,
-    raw: safeRaw, // stripped of circular refs
-    attachments,
-    state: st,
+export async function sendCarousel(psid, elements) {
+  return sendMessage(psid, {
+    attachment: {
+      type: "template",
+      payload: {
+        template_type: "generic",
+        elements,
+      },
+    },
   });
+}
 
-  const { replies = [], newState = null, reset = false } = result || {};
-
-  // Save/reset state
-  if (reset) {
-    await resetState(psid);
-  } else if (newState) {
-    await setState(psid, newState); // ✅ safe merge + JSON
-  }
-
-  // Deliver replies in sequence
-  for (const r of replies) {
-    if (!r || !r.type) continue;
-    switch (r.type) {
-      case 'text':
-        await sendText(psid, r.text);
-        break;
-      case 'buttons':
-        await sendButtons(psid, r.text, r.buttons);
-        break;
-      case 'images':
-        await sendImages(psid, r.urls);
-        break;
+async function callSendAPI(body) {
+  try {
+    const url = `${FB_GRAPH_API}/me/messages?access_token=${FB_PAGE_TOKEN}`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const json = await res.json();
+    if (!res.ok) {
+      console.error("Send API error:", json);
+      throw new Error(JSON.stringify(json));
     }
+    return json;
+  } catch (err) {
+    console.error("Send API fatal error:", err);
+    return null;
   }
 }
