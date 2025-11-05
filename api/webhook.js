@@ -1,8 +1,8 @@
-// /api/webhook.js
+// api/webhook.js
 export const config = { runtime: 'nodejs' };
 
 import { sendTypingOn, sendTypingOff } from '../server/lib/messenger.js';
-import * as Router from '../server/flows/router.js';
+import { handleMessage } from '../server/flows/router.js';
 
 const FB_VERIFY_TOKEN = process.env.FB_VERIFY_TOKEN || '';
 
@@ -28,43 +28,28 @@ export default async function handler(req, res) {
     }
 
     for (const entry of body.entry) {
-      const messaging = entry.messaging || [];
-      for (const evt of messaging) {
+      for (const evt of entry.messaging || []) {
         const psid = evt.sender && evt.sender.id;
         if (!psid) continue;
 
         const text =
           (evt.message && evt.message.text) ||
-          (evt.postback && (evt.postback.title || "")) ||
-          '';
-
-        const attachments =
-          (evt.message && evt.message.attachments) ||
-          [];
+          (evt.postback && evt.postback.title) || '';
 
         await sendTypingOn(psid);
         try {
-          if (Router && typeof Router.handleMessage === 'function') {
-            await Router.handleMessage({
-              psid,
-              text,
-              raw: evt,
-              attachments,
-              postback: evt.postback || null
-            });
-          } else {
-            console.error('Router.handleMessage not found');
-          }
+          await handleMessage({ psid, text, raw: evt });
         } catch (err) {
-          console.error('handleMessage error', err);
+          console.error('route/send error', err);
         } finally {
           await sendTypingOff(psid);
         }
       }
     }
+
     return res.status(200).json({ ok: true });
   } catch (err) {
     console.error('webhook error', err);
-    return res.status(500).json({ ok: false, error: String(err && err.message || err) });
+    return res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 }
