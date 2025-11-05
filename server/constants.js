@@ -1,58 +1,32 @@
 // server/constants.js
-export const BODY_TYPES = [
-  'sedan','suv','mpv','van','pickup','hatchback','crossover','auv','any'
-];
+export const PH_TZ = 'Asia/Manila';
+export const MEMORY_TTL_DAYS = Number(process.env.MEMORY_TTL_DAYS || 7);
 
-export const TRANS = ['automatic','manual','any','at','mt'];
+// Matching rules (silent)
+export const MATCH_DELTA_CASH = 50_000;     // ±50k around SRP for cash
+export const MATCH_DELTA_ALLIN = 50_000;    // +50k headroom for all-in
 
-export const YES = /^(yes|oo|opo|sige|go|ok|okay|game)$/i;
+// Offers paging
+export const MAX_OFFERS = 4;   // total units to keep per query (2 + 2)
+export const FIRST_BATCH = 2;  // show first 2, then "Others" for the next 2
 
-export const CITY_HINTS = [
-  'manila','qc','quezon city','pasig','makati','taguig','mandaluyong','pasay',
-  'caloocan','malabon','navotas','valenzuela','marikina','parañaque','las piñas',
-  'cavite','laguna','bulacan','rizal','cebu','davao','iloilo','bacolod','pampanga'
-];
+// Idle nudges (Phase 1 + Phase 3 cash)
+export const NUDGE_INTERVAL_MIN = 15;
+export const NUDGE_MAX_ATTEMPTS = 8;
+export const QUIET_START_HOUR = 21; // 9 PM
+export const QUIET_END_HOUR = 9;    // 9 AM
 
-export const INVENTORY_HEADERS = {
-  sku: 'SKU',
-  plate: 'plate_number',
-  year: 'year',
-  brand: 'brand',
-  model: 'model',
-  variant: 'variant',
-  transmission: 'transmission',
-  fuel: 'fuel_type',
-  body: 'body_type',
-  color: 'color',
-  mileage: 'mileage',
-  video: 'video_link',
-  drive: 'drive_link',
-  image_1: 'image_1',
-  image_10: 'image_10',
-  dealer_price: 'dealer_price',
-  srp: 'srp',
-  y2: '2yrs',
-  y3: '3yrs',
-  y4: '4yrs',
-  all_in: 'all_in',
-  price_status: 'price_status',
-  address: 'complete_address',
-  city: 'city',
-  province: 'province',
-  ncr: 'ncr_zone',
-  search_key: 'search_key',
-  lock_flag: 'lock_flag',
-  brand_model: 'brand_model',
-  updated_at: 'updated_at',
-  markup_rate: 'markup_rate'
-};
+// Financing docs follow-up
+export const DOCS_FOLLOW_INTERVAL_HOURS = 2;
+export const DOCS_FOLLOW_MAX_HOURS = 72; // ≈ 3 days
 
-export const SESSION_TTL_MS = 15 * 60 * 1000; // 15 minutes
-
+// Models (you can override via env)
+export const MODEL_DEFAULT = process.env.MODEL_DEFAULT || 'gpt-4.1-mini';
 export const NLG_MODEL = process.env.NLG_MODEL || 'gpt-4o-mini';
-export const EXTRACTOR_MODEL = process.env.EXTRACTOR_MODEL || 'gpt-4o-mini';
-export const TEMP_TONE = Number(process.env.TEMP_TONE || 0.95);
-export const FREQ_PENALTY_TONE = Number(process.env.FREQ_PENALTY_TONE || 0.1);
-export const PRES_PENALTY_TONE = Number(process.env.PRES_PENALTY_TONE || 0.4);
 
-export const DEBUG_LLM = process.env.DEBUG_LLM === '1';
+// Titles / payload helpers
+export const PAYLOADS = {
+  CONTINUE: 'continue',
+  START_OVER: 'start over',
+  SHOW_OTHERS: 'SHOW_OTHERS',
+};
