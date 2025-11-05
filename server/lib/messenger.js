@@ -1,101 +1,95 @@
-// Minimal FB Send API helpers + safe profile lookup
+// server/lib/messenger.js
+import { fetch } from 'undici';
 
-const PAGE_TOKEN = process.env.PAGE_ACCESS_TOKEN || process.env.FB_PAGE_TOKEN || "";
+const PAGE_TOKEN = process.env.PAGE_ACCESS_TOKEN || '';
 
-const FB_URL = "https://graph.facebook.com/v17.0/me/messages";
-const PROFILE_URL = (psid) => `https://graph.facebook.com/v17.0/${psid}?fields=first_name,last_name&access_token=${encodeURIComponent(PAGE_TOKEN)}`;
+const FB_SEND = 'https://graph.facebook.com/v19.0/me/messages';
+const FB_PROFILE = 'https://graph.facebook.com/v19.0/';
 
-async function fbFetch(url, body) {
-  const res = await fetch(url + `?access_token=${encodeURIComponent(PAGE_TOKEN)}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
+async function fbPost(url, body) {
+  const r = await fetch(`${url}?access_token=${PAGE_TOKEN}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
   });
-  const text = await res.text();
-  if (!res.ok) {
-    console.error("Send API error:", res.status, text);
+  const txt = await r.text();
+  if (!r.ok) {
+    console.error('Send API error:', r.status, txt);
   }
-  return { ok: res.ok, status: res.status, body: text };
+  return txt;
 }
 
 export async function sendTypingOn(psid) {
-  if (!PAGE_TOKEN) return;
-  await fbFetch(FB_URL, { recipient: { id: psid }, sender_action: "typing_on" });
+  return fbPost(FB_SEND, { recipient: { id: psid }, sender_action: 'typing_on' });
 }
 export async function sendTypingOff(psid) {
-  if (!PAGE_TOKEN) return;
-  await fbFetch(FB_URL, { recipient: { id: psid }, sender_action: "typing_off" });
+  return fbPost(FB_SEND, { recipient: { id: psid }, sender_action: 'typing_off' });
 }
 
-export async function sendText(psid, text) {
-  if (!PAGE_TOKEN) return;
-  return fbFetch(FB_URL, {
-    recipient: { id: psid },
-    messaging_type: "RESPONSE",
-    message: { text }
-  });
+export async function sendText(psid, text, quick_replies = null) {
+  const message = { text };
+  if (quick_replies?.length) message.quick_replies = quick_replies;
+  return fbPost(FB_SEND, { recipient: { id: psid }, messaging_type: 'RESPONSE', message });
 }
 
-export async function sendButtons(psid, text, buttons = []) {
-  if (!PAGE_TOKEN) return;
-  const payloadButtons = buttons.map(b => ({
-    type: "postback",
-    title: b.title,
-    payload: b.payload || b.title
-  }));
-  return fbFetch(FB_URL, {
+export async function sendButtons(psid, text, buttons) {
+  const payload = {
     recipient: { id: psid },
+    messaging_type: 'RESPONSE',
     message: {
       attachment: {
-        type: "template",
+        type: 'template',
         payload: {
-          template_type: "button",
+          template_type: 'button',
           text,
-          buttons: payloadButtons
+          buttons
         }
       }
     }
-  });
+  };
+  return fbPost(FB_SEND, payload);
 }
 
 export async function sendImage(psid, url) {
-  if (!PAGE_TOKEN || !url) return;
-  return fbFetch(FB_URL, {
-    recipient: { id: psid },
-    message: {
-      attachment: { type: "image", payload: { url, is_reusable: false } }
-    }
-  });
-}
-
-// Generic template carousel
-export async function sendCarousel(psid, elements = []) {
-  if (!PAGE_TOKEN || !elements.length) return;
-  return fbFetch(FB_URL, {
+  const payload = {
     recipient: { id: psid },
     message: {
       attachment: {
-        type: "template",
-        payload: { template_type: "generic", elements }
+        type: 'image',
+        payload: { url, is_reusable: false }
       }
     }
-  });
+  };
+  return fbPost(FB_SEND, payload);
 }
 
-export async function getProfile(psid) {
-  if (!PAGE_TOKEN) return null;
-  try {
-    const res = await fetch(PROFILE_URL(psid), { method: "GET" });
-    if (!res.ok) {
-      const t = await res.text();
-      // Don’t crash on (#3) capability errors in dev
-      console.warn("Profile API warn:", t);
-      return null;
+export async function sendGenericTemplate(psid, elements) {
+  const payload = {
+    recipient: { id: psid },
+    message: {
+      attachment: {
+        type: 'template',
+        payload: {
+          template_type: 'generic',
+          elements
+        }
+      }
     }
-    const j = await res.json();
-    return j || null;
+  };
+  return fbPost(FB_SEND, payload);
+}
+
+export async function getProfileName(psid) {
+  // This requires the app capability; if not granted, we fail gracefully.
+  try {
+    const r = await fetch(`${FB_PROFILE}${psid}?fields=first_name,last_name&access_token=${PAGE_TOKEN}`);
+    if (!r.ok) return null;
+    const j = await r.json();
+    const first = j.first_name?.trim() || '';
+    const last = j.last_name?.trim() || '';
+    const name = [first, last].filter(Boolean).join(' ').trim();
+    return name || null;
   } catch (e) {
-    console.warn("Profile API error:", e?.message || e);
     return null;
   }
 }
