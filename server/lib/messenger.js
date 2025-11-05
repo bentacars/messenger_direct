@@ -1,95 +1,91 @@
 // server/lib/messenger.js
-import { fetch } from 'undici';
+const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
+const FB_SEND = "https://graph.facebook.com/v19.0/me/messages";
 
-const PAGE_TOKEN = process.env.PAGE_ACCESS_TOKEN || '';
-
-const FB_SEND = 'https://graph.facebook.com/v19.0/me/messages';
-const FB_PROFILE = 'https://graph.facebook.com/v19.0/';
-
-async function fbPost(url, body) {
-  const r = await fetch(`${url}?access_token=${PAGE_TOKEN}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+async function fbPost(body) {
+  const res = await fetch(`${FB_SEND}?access_token=${PAGE_ACCESS_TOKEN}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body)
   });
-  const txt = await r.text();
-  if (!r.ok) {
-    console.error('Send API error:', r.status, txt);
-  }
+  const txt = await res.text();
+  if (!res.ok) console.error("Send API error:", res.status, txt);
   return txt;
 }
 
-export async function sendTypingOn(psid) {
-  return fbPost(FB_SEND, { recipient: { id: psid }, sender_action: 'typing_on' });
-}
-export async function sendTypingOff(psid) {
-  return fbPost(FB_SEND, { recipient: { id: psid }, sender_action: 'typing_off' });
+export async function sendTyping(psid, on = true) {
+  return fbPost({ recipient: { id: psid }, sender_action: on ? "typing_on" : "typing_off" });
 }
 
-export async function sendText(psid, text, quick_replies = null) {
+export async function sendText(psid, text, quickReplies = null) {
   const message = { text };
-  if (quick_replies?.length) message.quick_replies = quick_replies;
-  return fbPost(FB_SEND, { recipient: { id: psid }, messaging_type: 'RESPONSE', message });
+  if (Array.isArray(quickReplies) && quickReplies.length) {
+    message.quick_replies = quickReplies.map(q => ({
+      content_type: "text",
+      title: q.title,
+      payload: q.payload
+    }));
+  }
+  return fbPost({ recipient: { id: psid }, messaging_type: "RESPONSE", message });
 }
 
 export async function sendButtons(psid, text, buttons) {
-  const payload = {
+  return fbPost({
     recipient: { id: psid },
-    messaging_type: 'RESPONSE',
+    messaging_type: "RESPONSE",
     message: {
       attachment: {
-        type: 'template',
+        type: "template",
         payload: {
-          template_type: 'button',
+          template_type: "button",
           text,
-          buttons
+          buttons: buttons.map(b => ({ type: "postback", title: b.title, payload: b.payload }))
         }
       }
     }
-  };
-  return fbPost(FB_SEND, payload);
+  });
 }
 
 export async function sendImage(psid, url) {
-  const payload = {
+  return fbPost({
     recipient: { id: psid },
     message: {
       attachment: {
-        type: 'image',
+        type: "image",
         payload: { url, is_reusable: false }
       }
     }
-  };
-  return fbPost(FB_SEND, payload);
+  });
 }
 
-export async function sendGenericTemplate(psid, elements) {
-  const payload = {
+export async function sendCarousel(psid, cards) {
+  // cards: [{title, subtitle, image_url, buttons: [{title,payload}] }]
+  return fbPost({
     recipient: { id: psid },
     message: {
       attachment: {
-        type: 'template',
+        type: "template",
         payload: {
-          template_type: 'generic',
-          elements
+          template_type: "generic",
+          elements: cards.map(c => ({
+            title: c.title || "",
+            subtitle: c.subtitle || "",
+            image_url: c.image_url,
+            buttons: (c.buttons || []).map(b => ({ type: "postback", title: b.title, payload: b.payload }))
+          }))
         }
       }
     }
-  };
-  return fbPost(FB_SEND, payload);
+  });
 }
 
-export async function getProfileName(psid) {
-  // This requires the app capability; if not granted, we fail gracefully.
-  try {
-    const r = await fetch(`${FB_PROFILE}${psid}?fields=first_name,last_name&access_token=${PAGE_TOKEN}`);
-    if (!r.ok) return null;
-    const j = await r.json();
-    const first = j.first_name?.trim() || '';
-    const last = j.last_name?.trim() || '';
-    const name = [first, last].filter(Boolean).join(' ').trim();
-    return name || null;
-  } catch (e) {
-    return null;
+export async function sendMessages(psid, arr = []) {
+  // Simple sequential sender that understands the "type" contract used in router
+  for (const m of arr) {
+    if (m.type === "typing") await sendTyping(psid, m.on);
+    else if (m.type === "text") await sendText(psid, m.text);
+    else if (m.type === "buttons") await sendButtons(psid, m.text, m.buttons || []);
+    else if (m.type === "image") await sendImage(psid, m.url);
+    else if (m.type === "carousel") await sendCarousel(psid, m.cards || []);
   }
 }
