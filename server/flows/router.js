@@ -1,154 +1,83 @@
 // server/flows/router.js
 import { getSession, saveSession, clearSession } from '../lib/session.js';
-import { sendQuick, sendText, sendTypingOn, sendTypingOff } from '../lib/messenger.js';
-import { PAYLOADS, PH_TZ } from '../constants.js';
+import { sendText, sendButtons } from '../lib/messenger.js';
+import { handleInterrupts } from '../lib/interrupts.js';
+import { welcome } from './qualifier.js';
+import { phase1 } from './qualifier.js';
+import { showOffers, handleOffersAction } from './offers.js';
+import { cashFlow } from './cash.js';
+import { financingFlow } from './financing.js';
+import { initIfNeeded, applyExtraction, missingFields } from '../lib/state.js';
+import { extractQualifiers } from '../lib/llm.js';
 
-import * as Qualifier from './qualifier.js';
-import * as Offers from './offers.js';
-import * as Cash from './cash.js';
-import * as Fin from './financing.js';
-import { handleInterrupts, handleSmallTalk } from './interrupts.js';
+export async function route({ psid, text }) {
+  let s = await getSession(psid);
+  s = initIfNeeded(s);
 
-function wantsStartOver(t='') { return /^(start over|restart|reset)$/i.test(t); }
-function wantsContinue(t='') { return /^(continue|resume)$/i.test(t); }
-function greetOrStart(t='') { return /^(hi|hello|hey|start|get started)$/i.test(t); }
-
-function normalizeText(evt) {
-  const msg = evt.message || {};
-  if (msg.quick_reply?.payload) return String(msg.quick_reply.payload);
-  if (typeof msg.text === 'string') return msg.text;
-  if (evt.postback?.payload) return String(evt.postback.payload);
-  if (evt.postback?.title) return String(evt.postback.title);
-  return '';
-}
-
-export async function handleMessage({ psid, userText, rawEvent }) {
-  const text = (userText || normalizeText(rawEvent) || '').trim();
-
-  // load session
-  let session = (await getSession(psid)) || {};
-  session.lastInteractionAt = Date.now();
-  await saveSession(psid, session);
-
-  // Start Over / Continue
-  if (wantsStartOver(text)) {
+  // Commands
+  if (/^start over$/i.test(text)) {
     await clearSession(psid);
-    session = { psid, qualifiers:{} };
-    await saveSession(psid, session);
-    return Qualifier.start({ psid, session });
+    s = initIfNeeded({});
+    await welcome({ psid, returning: false });
+    return await saveSession(psid, s);
   }
-  if (wantsContinue(text) && session.funnel?.agent) {
-    // resume current agent
-  } else if (greetOrStart(text) && session.funnel?.agent) {
-    // show resume card
-    return sendQuick(psid, 'Welcome back! 😊 Itutuloy natin kung saan tayo huli, or start over?', [
-      { title:'Continue', payload: PAYLOADS.CONTINUE },
-      { title:'Start over', payload: PAYLOADS.START_OVER },
-    ]);
+  if (/^continue$/i.test(text)) {
+    await sendText(psid, "Sige, itutuloy ko kung saan tayo huli.");
   }
 
-  // Interrupt layer (FAQ/objections)
-  const pendingResume =
-    session.funnel?.agent === 'qualifier' ? 'Para ma-match kita, sagutin natin muna yung kulang.' :
-    session.funnel?.agent === 'offers'    ? 'Sige, tuloy ko ipapakita yung mga units na pasok.' :
-    session.phase === 'cash'              ? 'Tuloy natin ang viewing schedule / contact details.' :
-    session.phase === 'financing'         ? 'Tuloy natin ang financing estimate at docs.' :
-    'Tuloy natin.';
-
-  const intRes = await handleInterrupts(psid, text, pendingResume);
-  if (intRes.handled) return;
-
-  // If message is clearly small talk and not a field answer:
-  if (!text && rawEvent?.message?.attachments?.length) {
-    // attachments handled below (docs)
-  } else if (!session.funnel?.agent && !greetOrStart(text)) {
-    // small talk before start → short then start
-    await handleSmallTalk(psid, text, 'Game, start tayo para mahanap ko best unit.');
-    return Qualifier.start({ psid, session:{...session, qualifiers:{}} });
+  // First touch welcome
+  if (!s._welcomed) {
+    const returning = !!s._updated_at && (Date.now() - (s._updated_at || 0) < 7 * 86400000);
+    await welcome({ psid, returning });
+    s._welcomed = true;
+    await saveSession(psid, s);
+    if (!text) return;
   }
 
-  // Routing by agent/phase
-  if (!session.funnel?.agent) {
-    return Qualifier.start({ psid, session:{...session, qualifiers:{}} });
+  // Interrupts (FAQ, objections, offtopic)
+  const intr = await handleInterrupts({ utterance: text, state: s });
+  if (intr.handled) {
+    await sendText(psid, intr.text);
+    // then continue flow without resetting
   }
 
-  if (session.funnel.agent === 'qualifier') {
-    const done = await Qualifier.step({ psid, session, userText: text });
-    if (done === true || !pendingNext(session)) {
-      session.funnel.agent = 'offers';
-      await saveSession(psid, session);
-      return Offers.step({ psid, session });
+  // Route by phase
+  if (s.phase === 'qualifying') {
+    const result = await phase1({ psid, state: s, text });
+    await saveSession(psid, s);
+    if (result.done) {
+      await showOffers({ psid, state: s });
+      await saveSession(psid, s);
     }
-    return; // still collecting
+    return;
   }
 
-  // Offers navigation
-  if (session.funnel.agent === 'offers') {
-    if (text.startsWith('CHOOSE:')) {
-      const sku = text.split(':')[1];
-      const unit = Offers.findUnitBySku(session, sku);
-      if (!unit) return sendText(psid, 'Di ko mahanap yung unit na yan — pili ka ulit.');
-      await sendText(psid, 'Solid choice! 🔥 Sending full photos…');
-      await Cash.photos({ psid, session, unit });
-
-      if ((session.qualifiers||{}).payment === 'cash') {
-        session.phase = 'cash';
-        session.cash = { ...(session.cash||{}), unit };
-        await saveSession(psid, session);
-        return Cash.start({ psid, session });
-      } else {
-        session.phase = 'financing';
-        session.cash = { ...(session.cash||{}), unit }; // reuse address later
-        await saveSession(psid, session);
-        await Cash.start({ psid, session }); // schedule first (same rule)
-        return Fin.start({ psid, session });
-      }
+  if (s.phase === 'matching' || s.phase === 'offers') {
+    // Try to absorb new info while browsing offers (e.g., “qc sedan”)
+    const ex = await extractQualifiers(text);
+    applyExtraction(s, ex);
+    if (/^others$/i.test(text) || /^choose_/i.test(text) || /^widen$/i.test(text)) {
+      await handleOffersAction({ psid, state: s, text });
+    } else if (missingFields(s).length === 0 && s.phase !== 'offers') {
+      await showOffers({ psid, state: s });
     }
-    if (text === 'SHOW_OTHERS') {
-      return Offers.showOthers({ psid, session });
-    }
-    // otherwise, repeat batch
-    return Offers.step({ psid, session, userText: text });
+    await saveSession(psid, s);
+    return;
   }
 
-  // Phase 3 Cash
-  if (session.phase === 'cash') {
-    // attachments as docs? We ignore—cash flow only needs contact
-    if (!session.cash?.schedule_locked) {
-      return Cash.onSchedule({ psid, session, userText: text });
-    }
-    // expect name + mobile
-    return Cash.onContact({ psid, session, userText: text });
+  if (s.phase === 'cash_flow') {
+    await cashFlow({ psid, state: s, text });
+    await saveSession(psid, s);
+    return;
   }
 
-  // Phase 3 Financing
-  if (session.phase === 'financing') {
-    // doc uploads (image/PDF)
-    const atts = rawEvent?.message?.attachments || [];
-    if (atts.length) {
-      await Fin.onDocReceived({ psid, session });
-      return;
-    }
-    if (!session.cash?.schedule_locked) return Cash.onSchedule({ psid, session, userText: text });
-    if (!session.fin?.incomeType) {
-      return Fin.onIncomeType({ psid, session, userText: text });
-    }
-    // estimates
-    if (!session.fin?.sentEst) {
-      await Fin.sendEstimates({ psid, session, unit: session.cash?.unit });
-      session.fin.sentEst = true;
-      await saveSession(psid, session);
-      return;
-    }
-    // keep friendly loop
-    return Fin.onIncomeType({ psid, session, userText: text });
+  if (s.phase === 'financing_flow') {
+    await financingFlow({ psid, state: s, text });
+    await saveSession(psid, s);
+    return;
   }
 
-  // fallback
-  return sendText(psid, 'Sige, tuloy natin.');
-}
-
-function pendingNext(session) {
-  const q = session.qualifiers || {};
-  return !(q.payment && (q.budgetCash || q.budgetAllIn) && (q.locationCity || q.locationProvince) && q.trans && q.body);
+  // Fallback
+  await sendText(psid, "Hi ulit! Looking for something specific? How can I help you today?");
+  await saveSession(psid, s);
 }
