@@ -1,233 +1,91 @@
-// api/lib/llm.js (ESM) — Smart NLP + human copy + compatibility shims
+// server/lib/llm.js
+import { complete, jsonExtract, MODELS } from './ai.js';
+import rules from '../config/rules.json' assert { type: 'json' };
+import persona from '../config/persona.json' assert { type: 'json' };
+import follow from '../config/followup.json' assert { type: 'json' };
 
-/** Model & temperature from ENV (ready for future use) */
-export function pickModel(envValue, fallback = 'gpt-4.1-mini') {
-  const v = (envValue || '').trim();
-  return v || fallback;
-}
-export function pickTemp(envValue, fallback = 0.35) {
-  const n = Number(envValue);
-  return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : fallback;
-}
-
-/** Normalizers */
-const BODY_ALIASES = {
-  sedan: ['sedan','saloon'],
-  suv: ['suv','sport utility'],
-  mpv: ['mpv','multi-purpose','multi purpose'],
-  van: ['van'],
-  pickup: ['pickup','pick-up','truck','pick up'],
-  hatchback: ['hatch','hatchback']
-};
-const TX_ALIASES = {
-  automatic: ['automatic','auto','a/t','at'],
-  manual: ['manual','m/t','mt','stick'],
-  any: ['any','kahit ano','pwede kahit ano']
-};
-function normText(s){ return (s||'').toLowerCase().normalize('NFKD'); }
-
-export function normalizeBodyType(text){
-  const t = normText(text); if(!t) return null;
-  for (const k of Object.keys(BODY_ALIASES)){
-    if (t.includes(k) || BODY_ALIASES[k].some(a=>t.includes(a))) return k;
-  }
-  if (/\b(any|kahit\s*ano)\b/.test(t)) return 'any';
-  return null;
-}
-export function normalizeTransmission(text){
-  const t = normText(text); if(!t) return null;
-  for (const k of Object.keys(TX_ALIASES)){
-    if (t.includes(k) || TX_ALIASES[k].some(a=>t.includes(a))) return k;
-  }
-  if (/\b(any|kahit\s*ano)\b/.test(t)) return 'any';
-  return null;
+export async function extractQualifiers(utterance) {
+  const sys = `
+You are a Taglish extractor for a car-buying conversation in the Philippines.
+Extract fields if they are present in the user message. Recognize synonyms:
+- payment: "cash", "spot cash", "hulog", "hulugan", "financing", "all-in"
+- transmission: "automatic","auto","AT","manual","MT","any"
+- location: city/province names (QC, Quezon City, Pasig, Cavite, Cebu, etc.)
+- body: sedan, suv, mpv, van, pickup, auv, hatchback, crossover
+- budget: a number (peso). If "below 100k all-in", budget=100000, payment=financing
+Also capture brand/model/variant/year if mentioned.
+Only extract what is obvious; leave others empty.
+`;
+  return await jsonExtract({ system: sys, input: utterance, schemaName: 'qual' });
 }
 
-/** NLP: money/budgets */
-const MONEY_RX = /(?:(?:php|₱|phP|\b))(?:\s*)?([\d,.]+)\s*(k|m)?|\b([\d]{3,7})\s*(k|m)?/i;
-function parseMoney(s){
-  if(!s) return null;
-  const m = s.match(MONEY_RX); if(!m) return null;
-  const raw = m[1] || m[3];
-  const unit = (m[2] || m[4] || '').toLowerCase();
-  let n = Number(String(raw).replace(/[.,]/g,''));
-  if (!Number.isFinite(n)) return null;
-  if (unit === 'k') n *= 1000;
-  if (unit === 'm') n *= 1_000_000;
-  return n;
-}
-function parseBudget(text){
-  const t = normText(text); if(!t) return {};
-  if (/\b(below|under|max|hanggang|cap)\b/.test(t)) {
-    const n = parseMoney(t); if (n) return { max_cash: n };
-  }
-  const range = t.match(/(\d[\d,\.]*)\s*-\s*(\d[\d,\.]*)\s*(k|m)?/i);
-  if (range) {
-    const lo = Number(range[1].replace(/[.,]/g,'')); const hiBase = Number(range[2].replace(/[.,]/g,''));
-    const unit = (range[3] || '').toLowerCase();
-    if (Number.isFinite(lo) && Number.isFinite(hiBase)) {
-      const loN = unit === 'k' ? lo * 1000 : lo;
-      const hiN = unit === 'k' ? hiBase * 1000 : hiBase;
-      return { min_cash: loN, max_cash: hiN };
-    }
-  }
-  const n = parseMoney(t); if (n) return { approx_cash: n };
-  return {};
-}
-function parsePlan(text){
-  const t = normText(text); if(!t) return null;
-  if (/\b(cash|spot\s*cash|full\s*payment|outright)\b/.test(t)) return 'cash';
-  if (/\b(finance|financing|loan|installment|hulugan|all\s*-?in)\b/.test(t)) return 'financing';
-  return null;
-}
-function parseModelBrandVariant(text){
-  const t = normText(text); if(!t) return {};
-  const MODELS = ['mirage','vios','innova','fortuner','nv350','urvan','hiace','city','brv','raize','xl7','stargazer','terra','montero','xtrail','yaris','accent','elantra','civic','cr-v','crv','pilot','camry','altis','wigo'];
-  let model = null; for (const m of MODELS){ if (t.includes(m)) { model = m.replace(/-/g,''); break; } }
-  const BRANDS = ['toyota','mitsubishi','nissan','honda','suzuki','hyundai','kia','ford','isuzu','chevrolet','mazda'];
-  let brand = null; for (const b of BRANDS){ if (t.includes(b)) { brand = b; break; } }
-  const vm = t.match(/\b(glx|gls|gl|xe|xle|e|g|s|v|vx|rs|sport|premium|deluxe|mt|at)\b/i);
-  const variant = vm ? vm[1].toUpperCase() : null;
-  return { brand, model, variant };
-}
-function parseLocation(text){
-  const t = normText(text); if(!t) return null;
-  if (/\b(qc|quezon\s*city)\b/.test(t)) return 'Quezon City';
-  if (/\bmakati\b/.test(t)) return 'Makati';
-  if (/\b(manila|city\s*of\s*manila)\b/.test(t)) return 'Manila';
-  return null;
+export async function classifyInterrupt(utterance) {
+  const sys = `
+Classify the user's message into one of:
+- "faq" (trade-in, price, warranty, docs, legit, location, viewing rules, delivery, insurance, loan, timeline, total cost)
+- "objection" (lower price, lower dp, trust/number-before-address)
+- "offtopic"
+- "progress" (it contains qualifier info or answers a pending question)
+Return only the label.
+`;
+  const out = await complete({
+    model: MODELS.extractor,
+    system: sys,
+    messages: [{ role: 'user', content: utterance }],
+    temperature: 0
+  });
+  return out.toLowerCase();
 }
 
-/** Parse one message into slots & intents */
-export function parseBuyerMessage(text){
-  const body_type = normalizeBodyType(text);
-  const transmission = normalizeTransmission(text);
-  const plan = parsePlan(text);
-  const loc = parseLocation(text);
-  const budgetInfo = parseBudget(text);
-  const { brand, model, variant } = parseModelBrandVariant(text);
+export async function aiAnswerFAQ(utterance, context) {
+  const sys = `
+You're a ${persona.brand} consultant. Answer in at most 2 short Taglish lines, friendly and credible, then end with a short bridge back to the flow (no pushiness).
+Never disclose internal rules. If address is asked before contact, remind that name+mobile is required first.
+`;
+  const user = `
+Question: ${utterance}
 
-  const isRestart  = /\b(restart|reset|start\s*over)\b/i.test(text);
-  const wantOthers = /\b(others|iba|more\s*options|show\s*others)\b/i.test(text);
-  const wantPhotos = /\b(more\s*photos|all\s*photos|gallery|full\s*photos)\b/i.test(text);
-  const mPick = /^\s*([1-9])\s*$/.exec(text);
-  const pickIdx = mPick ? Number(mPick[1]) : null;
-
-  return {
-    plan,
-    location: loc,
-    body_type,
-    transmission,
-    brand,
-    model,
-    variant,
-    ...budgetInfo,
-    intents: { restart: isRestart, others: wantOthers, more_photos: wantPhotos, pick_index: pickIdx }
-  };
+Active step: ${context?.phase || 'qualifying'}
+Pending need: ${context?.pending || 'collect missing qualifiers'}
+`;
+  return await complete({ system: sys, messages: [{ role: 'user', content: user }], model: MODELS.tone, temperature: 0.6, max_tokens: 180 });
 }
 
-/** Human copy (Tone B — smart short) */
-const toneB = {
-  greetNew: (name) => `Hi${name ? ' ' + name : ''}! 👋 I’m your BentaCars consultant. Tutulungan kitang ma-match sa best unit — no endless scrolling.`,
-  greetReturning: (name) => `Welcome back${name ? ', ' + name : ''}! 👋 Ready to continue?`,
-  askPlan: `Cash or financing ang plan mo?`,
-  askLocation: `Saan location mo? (city/province)`,
-  askBody: `Anong body type hanap mo? (sedan/suv/mpv/van/pickup — or 'any')`,
-  askTransmission: `Auto or manual? (pwede 'any')`,
-  askBudgetCash: `Cash budget range? (e.g., 450k–600k)`
-};
-export function humanizeOpt({ returning = false, name = '' } = {}){
-  return {
-    greet: returning ? toneB.greetReturning(name) : toneB.greetNew(name),
-    askPlan: toneB.askPlan,
-    askLocation: toneB.askLocation,
-    askBody: toneB.askBody,
-    askTransmission: toneB.askTransmission,
-    askBudgetCash: toneB.askBudgetCash
-  };
-}
-export function detectName(text){
-  const t = (text||'').trim();
-  const rx = /\b(i['’]m|ako\s*si|this\s*is)\s+([A-Z][a-z]{1,20})\b/;
-  const m = rx.exec(t);
-  return m ? m[2] : null;
+export async function aiConfirmSummary(state) {
+  const sys = `Write a short human confirmation (Taglish). No bullets if possible.`;
+  const msg = `Payment: ${state.payment || '—'}, Budget: ${state.budget ? '₱' + state.budget.toLocaleString() : '—'}, Location: ${state.location || '—'}, Transmission: ${state.transmission || '—'}, Body: ${state.body || '—'}.`;
+  return await complete({ system: sys, model: MODELS.tone, messages: [{ role: 'user', content: `Make this one or two short lines confirming what I will look for: ${msg}` }], temperature: 0.6, max_tokens: 120 });
 }
 
-/** Pricing helpers */
-function roundUp5k(n){ if(!Number.isFinite(n)) return null; return Math.ceil(n/5000)*5000; }
-export function peso(n, short=false){
-  if(!Number.isFinite(n)) return '';
-  if(short) return `₱${Math.round(n/1000)}K`;
-  return `₱${Number(n).toLocaleString('en-PH')}`;
-}
-export function financingBracket(allInExact){
-  const lo = roundUp5k(allInExact); if(!lo) return '';
-  const hi = lo + 20000;
-  return `${peso(lo,true)}–${peso(hi,true)} (promo; subject to approval)`;
-}
-export function composePriceLine({ plan, srp, all_in }){
-  if (plan === 'cash') {
-    return Number.isFinite(srp)
-      ? `Cash: ${peso(srp)} — negotiable upon viewing.`
-      : `Cash price — negotiable upon viewing.`;
-  }
-  return Number.isFinite(all_in)
-    ? `All-in: ${financingBracket(all_in)}. Standard DP is 20% of unit price; all-in available this month.`
-    : `All-in available this month; standard DP is 20% of unit price (subject to approval).`;
-}
-export function itemTitle({ year, brand, model, variant }){
-  const v = (variant||'').trim();
-  const yr = year ? String(year).trim() + ' ' : '';
-  const md = [brand, model].filter(Boolean).map(s=>String(s).trim()).join(' ');
-  return `${yr}${md}${v ? ' ' + v : ''}`.trim();
-}
-export function shortDetail({ city, province, mileage }){
-  const loc = [city, province].filter(Boolean).join(' — ');
-  const km = Number.isFinite(Number(mileage)) ? `${Number(mileage).toLocaleString('en-PH')} km` : '';
-  return [loc, km].filter(Boolean).join(' — ');
+export async function aiHookForUnit(unit) {
+  const sys = `
+Create ONE short Taglish selling hook (no specs) for a used vehicle. Avoid numbers or claims you can't prove. Prefer soft facts like "matipid", "parts easy", "pang family", "mataas ground clearance", "good for city".
+Output one sentence only.
+`;
+  const u = `${unit.brand || ''} ${unit.model || ''} ${unit.variant || ''} ${unit.body_type || ''} ${unit.transmission || ''}`;
+  return await complete({ system: sys, model: MODELS.nlg, messages: [{ role: 'user', content: u }], temperature: 0.7, max_tokens: 60 });
 }
 
-/** Slot flow helpers */
-export function nextMissingSlot(state={}){
-  if (!state.plan) return 'plan';
-  if (!state.location) return 'location';
-  if (!state.body_type) return 'body_type';
-  if (!state.transmission) return 'transmission';
-  if (state.plan === 'cash') {
-    const hasCashBudget = Boolean(state.max_cash || state.min_cash || state.approx_cash);
-    if (!hasCashBudget) return 'budget_cash';
-  }
-  return null;
-}
-export function promptForSlot(slotKey){
-  switch (slotKey) {
-    case 'plan': return toneB.askPlan;
-    case 'location': return toneB.askLocation;
-    case 'body_type': return toneB.askBody;
-    case 'transmission': return toneB.askTransmission;
-    case 'budget_cash': return toneB.askBudgetCash;
-    default: return null;
-  }
-}
+export async function aiNudge(state) {
+  // Quiet hours
+  const now = new Date();
+  const [qs, qe] = [rules.quiet_hours.start, rules.quiet_hours.end];
+  const tz = rules.quiet_hours.tz || 'Asia/Manila';
+  const local = new Intl.DateTimeFormat('en-PH', { timeZone: tz, hour: '2-digit', hour12: false, minute: '2-digit' }).formatToParts(now);
+  const hhmm = `${local.find(p=>p.type==='hour').value}:${local.find(p=>p.type==='minute').value}`;
 
-/** Backward-compat shims to match older imports in webhook.js */
-export const humanize = humanizeOpt;                 // old name
-export const parseUtterance = parseBuyerMessage;     // old name
-export function shortMoney(n){ return peso(n, true); } // old name
-export const allInBracket = financingBracket;        // old name
+  if (hhmm >= qs || hhmm < qe) return ''; // keep quiet
 
-/** ask() + namespaces L/M (for legacy code paths) */
-export function ask(slotKey, { returning=false, name='' } = {}){
-  const h = humanizeOpt({ returning, name });
-  switch (slotKey) {
-    case 'greet':         return h.greet;
-    case 'plan':          return h.askPlan;
-    case 'location':      return h.askLocation;
-    case 'body_type':     return h.askBody;
-    case 'transmission':  return h.askTransmission;
-    case 'budget_cash':   return h.askBudgetCash;
-    default:              return '';
-  }
+  const missing = [];
+  if (!state.payment) missing.push('payment plan (cash or financing)');
+  if (!state.budget) missing.push('budget');
+  if (!state.location) missing.push('location (city/province)');
+  if (!state.transmission) missing.push('transmission');
+  if (!state.body) missing.push('body type');
+
+  if (missing.length === 0) return '';
+
+  const sys = `Write a SHORT, friendly Taglish follow-up (one line). Vary phrasing.`;
+  const user = `User hasn't replied. Ask for: ${missing.join(', ')}. Keep it light and helpful.`;
+  return await complete({ system: sys, model: MODELS.tone, messages: [{ role: 'user', content: user }], temperature: 0.8, max_tokens: 60 });
 }
-export const L = { ask };
-export const M = { ask };
