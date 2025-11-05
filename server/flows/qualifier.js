@@ -1,99 +1,55 @@
 // server/flows/qualifier.js
-import { extractQual, nlgTone } from '../lib/ai.js';
-import { BODY_TYPES, TRANS } from '../constants.js';
+import { saveSession } from '../lib/session.js';
+import { sendText } from '../lib/messenger.js';
+import { extractQualifiersHeuristic, nlg } from '../lib/ai.js';
 
-const normalize = (s='') => (s || '').toString().trim().toLowerCase();
+function missingFields(q) {
+  const need = [];
+  if (!q.payment) need.push('payment');
+  if (q.payment === 'cash' && !q.budgetCash) need.push('budgetCash');
+  if (q.payment === 'financing' && !q.budgetAllIn) need.push('budgetAllIn');
+  if (!q.locationCity && !q.locationProvince) need.push('location');
+  if (!q.trans) need.push('trans');
+  if (!q.body) need.push('body');
+  return need;
+}
 
-function mergeSession(session, patch) {
-  session.qualifier = session.qualifier || {};
-  for (const [k, v] of Object.entries(patch || {})) {
-    if (v === null || v === undefined || v === '') continue;
-    session.qualifier[k] = v;
+function resumePrompt(q) {
+  const need = missingFields(q);
+  if (!need.length) return '';
+  const n = need[0];
+  if (n === 'payment') return 'Pwede tayo cash or hulugan — alin ang prefer mo?';
+  if (n === 'budgetCash') return 'Magkano target cash budget mo? (e.g., ₱550,000)';
+  if (n === 'budgetAllIn') return 'Magkano kaya mong all-in? (e.g., ₱95,000)';
+  if (n === 'location') return 'Nationwide tayo — saan ka based (city/province) para ma-match ko sa pinakamalapit?';
+  if (n === 'trans') return 'Auto, manual, o okay lang kahit alin?';
+  if (n === 'body') return '5-seater (sedan/hatch) o 7+ seater (SUV/MPV)? Pwede ring van/pickup.';
+  return '';
+}
+
+export async function start({ psid, session }) {
+  const welcome = 'Hi! 👋 Ako na bahala mag-match ng best unit para sa’yo—hindi mo na kailangang mag-scroll nang marami. Let’s find your car, fast.';
+  await sendText(psid, welcome);
+  session.funnel = { agent:'qualifier' };
+  session.qualifiers = session.qualifiers || {};
+  await saveSession(psid, session);
+  const ask = resumePrompt(session.qualifiers);
+  if (ask) await sendText(psid, ask);
+}
+
+export async function step({ psid, session, userText }) {
+  session.qualifiers = session.qualifiers || {};
+  const got = extractQualifiersHeuristic(userText || '');
+  session.qualifiers = { ...session.qualifiers, ...got };
+  await saveSession(psid, session);
+
+  const ask = resumePrompt(session.qualifiers);
+  if (ask) {
+    // Conversational phrasing via LLM NLG
+    const line = await nlg({ user: `Rewrite this as a short Taglish friendly question: "${ask}"` });
+    return sendText(psid, line);
   }
+
+  // All set → Phase 2 handoff is in router
+  return true;
 }
-
-function isComplete(q) {
-  return !!(q.payment && q.budget_number && q.location_city && q.transmission && q.body_type);
-}
-
-function humanSummary(q, name) {
-  const who = name ? `${name}, ` : '';
-  const pay = q.payment === 'financing' ? 'Financing' : 'Cash';
-  const trans = q.transmission?.toUpperCase();
-  const bt = q.body_type?.toUpperCase();
-  const pref = [q.pref_brand, q.pref_model, q.pref_variant, q.pref_year].filter(Boolean).join(' ');
-  const prefLine = pref ? `\n• Pref: ${pref}` : '';
-  return `${who}ito’ng haharapin ko for you:
-• ${pay}
-• Budget ~ ₱${Number(q.budget_number).toLocaleString()}
-• Location: ${q.location_city}
-• Trans: ${trans}
-• Body: ${bt}${prefLine}
-Saglit, I’ll pull the best units that fit this. 🔎`;
-}
-
-export default {
-  async step(session, userText, raw) {
-    session.history = session.history || [];
-    // Append user turn
-    session.history.push({ role: 'user', content: userText });
-
-    // Extract/merge qualifiers
-    const parsed = await extractQual({ history: session.history });
-    const patch = {};
-
-    // Normalize fields
-    if (parsed.payment) {
-      patch.payment = normalize(parsed.payment).includes('financ') || normalize(parsed.payment).includes('hulug') ? 'financing' : 'cash';
-    }
-    if (parsed.budget_number) patch.budget_number = parseInt(parsed.budget_number, 10);
-    if (parsed.location_city) patch.location_city = parsed.location_city.trim();
-    if (parsed.transmission) {
-      let t = normalize(parsed.transmission);
-      if (t === 'at') t = 'automatic';
-      if (t === 'mt') t = 'manual';
-      if (!TRANS.includes(t)) t = 'any';
-      patch.transmission = t;
-    }
-    if (parsed.body_type) {
-      let b = normalize(parsed.body_type);
-      if (!BODY_TYPES.includes(b)) b = 'any';
-      patch.body_type = b;
-    }
-    // preferences
-    patch.pref_brand = parsed.pref_brand || session.qualifier?.pref_brand || null;
-    patch.pref_model = parsed.pref_model || session.qualifier?.pref_model || null;
-    patch.pref_year = parsed.pref_year || session.qualifier?.pref_year || null;
-    patch.pref_variant = parsed.pref_variant || session.qualifier?.pref_variant || null;
-
-    mergeSession(session, patch);
-
-    // Decide next message
-    if (!isComplete(session.qualifier)) {
-      // Ask *only* the missing items in a human way using NLG
-      const missing = [];
-      if (!session.qualifier.payment) missing.push('payment (cash o hulugan)');
-      if (!session.qualifier.budget_number) missing.push('budget');
-      if (!session.qualifier.location_city) missing.push('location (city/province)');
-      if (!session.qualifier.transmission) missing.push('transmission (AT/MT/any)');
-      if (!session.qualifier.body_type) missing.push('body type (sedan/suv/mpv/van/pickup/hatchback/crossover/any)');
-
-      const sysRecap = Object.entries(session.qualifier)
-        .filter(([,v]) => v)
-        .map(([k,v]) => `${k}: ${v}`)
-        .join(', ');
-
-      const prompt = [
-        { role: 'system', content: `So far we have: ${sysRecap || 'none yet'}. Ask for ONLY the missing info: ${missing.join(', ')}. Keep it short, Taglish, friendly.`}
-      ];
-      const reply = await nlgTone({ history: prompt.concat(session.history), session });
-      session.history.push({ role: 'assistant', content: reply });
-      return { done: false, message: reply };
-    }
-
-    // Complete — provide human summary to transition to offers
-    const reply = humanSummary(session.qualifier, session.name);
-    session.history.push({ role: 'assistant', content: reply });
-    return { done: true, message: reply };
-  }
-};
