@@ -1,5 +1,5 @@
 // api/webhook.js
-export const config = { runtime: 'nodejs18.x' };
+export const config = { runtime: 'nodejs' };
 
 import { route } from '../server/flows/router.js';
 import { sendTypingOn, sendTypingOff } from '../server/lib/messenger.js';
