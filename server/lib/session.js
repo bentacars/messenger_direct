@@ -1,60 +1,55 @@
-// server/lib/session.js
-// Stores session/state data per user (7-day memory window)
-// Requires Vercel KV binding: KV_REST_API_URL + KV_REST_API_TOKEN
+// server/lib/state.js
+// Simpler, safer KV wrapper (avoids circular and V1 issues)
 
-import fetch from "node-fetch";
+import fetch from 'node-fetch';
 
 const KV_URL = process.env.KV_REST_API_URL;
 const KV_TOKEN = process.env.KV_REST_API_TOKEN;
 
 if (!KV_URL || !KV_TOKEN) {
-  console.warn("[session] Missing KV_REST_API_URL or KV_REST_API_TOKEN");
+  throw new Error('KV env vars missing');
 }
 
-function pk(psid) {
-  return `session:${psid}`;
+const headers = {
+  Authorization: `Bearer ${KV_TOKEN}`,
+  'Content-Type': 'application/json',
+};
+
+function sk(psid) {
+  return `state:${psid}`;
 }
 
-async function kvFetch(method, key, body) {
-  const url = `${KV_URL}/v1/kv/${key}`;
-  const opts = {
-    method,
-    headers: {
-      Authorization: `Bearer ${KV_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-  };
-  if (body) opts.body = JSON.stringify(body);
-  const r = await fetch(url, opts);
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    console.error(`[session] KV error ${method} ${key}`, r.status, t);
-  }
-  return r;
-}
-
-export async function getSession(psid) {
-  const r = await kvFetch("GET", pk(psid));
-  if (!r || !r.ok) return null;
+// -------------- GET --------------
+export async function getState(psid) {
+  const key = sk(psid);
+  const r = await fetch(`${KV_URL}/get/${key}`, { headers });
+  if (!r.ok) return null;
+  const t = await r.text();
   try {
-    return await r.json();
+    return t ? JSON.parse(t) : null;
   } catch {
     return null;
   }
 }
 
-export async function setSession(psid, data = {}) {
-  await kvFetch("PUT", pk(psid), data);
-  return data;
+// -------------- SET / MERGE --------------
+export async function setState(psid, patch) {
+  const old = (await getState(psid)) || {};
+  const safe = JSON.parse(JSON.stringify(patch)); // avoid circular refs
+  const merged = { ...old, ...safe, updated_at: Date.now() };
+
+  await fetch(`${KV_URL}/set/${sk(psid)}`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(merged),
+  });
+  return merged;
 }
 
-export async function clearSession(psid) {
-  await kvFetch("DELETE", pk(psid));
-}
-
-export async function touchSession(psid) {
-  const sess = (await getSession(psid)) || {};
-  sess.updated_at = Date.now();
-  await setSession(psid, sess);
-  return sess;
+// -------------- RESET --------------
+export async function resetState(psid) {
+  await fetch(`${KV_URL}/del/${sk(psid)}`, {
+    method: 'POST',
+    headers,
+  });
 }
