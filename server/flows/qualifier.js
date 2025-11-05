@@ -1,55 +1,43 @@
 // server/flows/qualifier.js
-import { saveSession } from '../lib/session.js';
-import { sendText } from '../lib/messenger.js';
-import { extractQualifiersHeuristic, nlg } from '../lib/ai.js';
+import { extractQualifiers } from '../lib/llm.js';
+import { sendText, sendButtons } from '../lib/messenger.js';
+import { applyExtraction, missingFields } from '../lib/state.js';
 
-function missingFields(q) {
-  const need = [];
-  if (!q.payment) need.push('payment');
-  if (q.payment === 'cash' && !q.budgetCash) need.push('budgetCash');
-  if (q.payment === 'financing' && !q.budgetAllIn) need.push('budgetAllIn');
-  if (!q.locationCity && !q.locationProvince) need.push('location');
-  if (!q.trans) need.push('trans');
-  if (!q.body) need.push('body');
-  return need;
-}
+export async function phase1({ psid, state, text }) {
+  // Use extractor to update state
+  const ex = await extractQualifiers(text);
+  applyExtraction(state, ex);
 
-function resumePrompt(q) {
-  const need = missingFields(q);
-  if (!need.length) return '';
-  const n = need[0];
-  if (n === 'payment') return 'Pwede tayo cash or hulugan — alin ang prefer mo?';
-  if (n === 'budgetCash') return 'Magkano target cash budget mo? (e.g., ₱550,000)';
-  if (n === 'budgetAllIn') return 'Magkano kaya mong all-in? (e.g., ₱95,000)';
-  if (n === 'location') return 'Nationwide tayo — saan ka based (city/province) para ma-match ko sa pinakamalapit?';
-  if (n === 'trans') return 'Auto, manual, o okay lang kahit alin?';
-  if (n === 'body') return '5-seater (sedan/hatch) o 7+ seater (SUV/MPV)? Pwede ring van/pickup.';
-  return '';
-}
+  const need = missingFields(state);
 
-export async function start({ psid, session }) {
-  const welcome = 'Hi! 👋 Ako na bahala mag-match ng best unit para sa’yo—hindi mo na kailangang mag-scroll nang marami. Let’s find your car, fast.';
-  await sendText(psid, welcome);
-  session.funnel = { agent:'qualifier' };
-  session.qualifiers = session.qualifiers || {};
-  await saveSession(psid, session);
-  const ask = resumePrompt(session.qualifiers);
-  if (ask) await sendText(psid, ask);
-}
-
-export async function step({ psid, session, userText }) {
-  session.qualifiers = session.qualifiers || {};
-  const got = extractQualifiersHeuristic(userText || '');
-  session.qualifiers = { ...session.qualifiers, ...got };
-  await saveSession(psid, session);
-
-  const ask = resumePrompt(session.qualifiers);
-  if (ask) {
-    // Conversational phrasing via LLM NLG
-    const line = await nlg({ user: `Rewrite this as a short Taglish friendly question: "${ask}"` });
-    return sendText(psid, line);
+  if (need.length === 0) {
+    state.phase = 'matching';
+    state.pending = 'match';
+    return { done: true };
   }
 
-  // All set → Phase 2 handoff is in router
-  return true;
+  // Ask only ONE missing thing to sound natural
+  const ask = {
+    payment: "Sige. Cash or financing ang plan mo?",
+    budget: "Para hindi ako lumampas, mga magkano ang budget mo?",
+    location: "Saan ka based (city/province) para malapit ang options?",
+    transmission: "Auto or manual prefer mo? (Pwede rin 'any'.)",
+    body: "Body type mo—sedan, hatchback, SUV/MPV, van o pickup?"
+  };
+
+  const key = need[0];
+  await sendText(psid, ask[key]);
+  state.pending = key;
+  return { done: false };
+}
+
+export async function welcome({ psid, returning }) {
+  if (returning) {
+    await sendButtons(psid, "Welcome back! 😊 Itutuloy natin kung saan tayo huli, or start over?", [
+      { title: 'Continue', payload: 'Continue' },
+      { title: 'Start over', payload: 'Start over' }
+    ]);
+  } else {
+    await sendText(psid, "Hi! 👋 I’m your BentaCars consultant. Ako na bahala mag-match ng best unit para sa’yo—hindi mo na kailangang mag-scroll nang mag-scroll. Let’s find your car, fast.");
+  }
 }
