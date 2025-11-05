@@ -1,35 +1,55 @@
 // server/lib/session.js
-const SESSIONS = new Map();
-const TTL_MS = 1000 * 60 * 60 * 24 * 7; // 7 days
+// KV-backed session with idle tracking + indexing for nudges
 
-function now() { return Date.now(); }
+const KV_URL   = process.env.KV_REST_API_URL;
+const KV_TOKEN = process.env.KV_REST_API_TOKEN;
+const TTL_DAYS = Number(process.env.MEMORY_TTL_DAYS || 14);
 
-export function getSession(id) {
-  let s = SESSIONS.get(id);
-  if (!s || (s.expiresAt && s.expiresAt < now())) {
-    s = { id, createdAt: now(), expiresAt: now() + TTL_MS, funnel: {}, qualifier: {}, offers: {}, status: 'active' };
-    SESSIONS.set(id, s);
-  }
-  return s;
+async function kv(cmd, ...args) {
+  const res = await fetch(`${KV_URL}`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${KV_TOKEN}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ // Upstash REST "pipeline" format
+      pipeline: [[cmd, ...args]]
+    }),
+  });
+  const out = await res.json();
+  if (!res.ok) throw new Error(out?.error || `KV ${cmd} failed`);
+  return out?.results?.[0];
 }
 
-export function saveSession(id, patch = {}) {
-  const cur = getSession(id);
-  const next = { ...cur, ...patch, expiresAt: now() + TTL_MS };
-  SESSIONS.set(id, next);
-  return next;
+const key = (pid) => `sess:${pid}`;
+
+export async function getSession(pid) {
+  const r = await kv("GET", key(pid));
+  if (!r || !r.result) return null;
+  return JSON.parse(r.result);
 }
 
-export function clearSession(id) {
-  const s = getSession(id);
-  // keep answers but mark paused
-  s.status = 'paused';
-  s.pausedAt = now();
-  s.offeredResumeAt = 0; // so we can show resume card on next message
-  SESSIONS.set(id, s);
-  return s;
+export async function saveSession(pid, patch = {}) {
+  const k = key(pid);
+  const now = Date.now();
+  const cur = (await getSession(pid)) || {};
+  const session = {
+    ...cur,
+    ...patch,
+    pid,
+    lastInteractionAt: patch.lastInteractionAt ?? now,
+    updatedAt: now,
+  };
+  const ttlSec = TTL_DAYS * 24 * 60 * 60;
+  await kv("SET", k, JSON.stringify(session), "EX", ttlSec);
+  // index for the nudge cron
+  await kv("SADD", "sess:index", pid);
+  return session;
 }
 
-export function hardReset(id) {
-  SESSIONS.delete(id);
+export async function clearSession(pid) {
+  await kv("DEL", key(pid));
+  await kv("SREM", "sess:index", pid);
+}
+
+export async function listAllSessionPids() {
+  const r = await kv("SMEMBERS", "sess:index");
+  return r?.result ?? [];
 }
