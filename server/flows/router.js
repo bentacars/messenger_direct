@@ -1,147 +1,137 @@
-// Central conversation router (Phase 1 → Phase 2 → Phase 3)
-// Uses Qualifier.* (your existing module) and Offers.step()
+// /server/flows/router.js
+// Central conversation router: Phase 1 → Phase 2 → Phase 3 (cash/financing stubs)
 
-import * as Qualifier from "./qualifier.js";
-import * as Offers from "./offers.js";
-import { sendText, sendButtons, sendImage, sendCarousel, sendTypingOn, sendTypingOff } from "../lib/messenger.js";
-import { nlgLine } from "../lib/ai.js";
+import * as Qualifier from './qualifier.js';
+import Offers from './offers.js';
+import { sendText, sendButtons, flushMessages } from '../lib/messenger.js';
+import { nlg } from '../lib/ai.js';
 
 const MEMORY_TTL_DAYS = Number(process.env.MEMORY_TTL_DAYS || 7);
 
-// In-memory session store (works fine for dev)
-const SESS = new Map();
-
-function isStale(ts) {
-  const ttl = MEMORY_TTL_DAYS * 24 * 60 * 60 * 1000;
-  return !ts || Date.now() - ts > ttl;
-}
-
-function needPhase1(qual) {
-  return !(qual?.payment && qual?.budget && qual?.location && qual?.transmission && qual?.bodyType);
-}
-
-function shortAskForMissing(qual) {
-  if (!qual.payment)  return "Pwede cash or hulugan—alin ang mas okay sa’yo?";
-  if (!qual.budget)   return "Para hindi ako lumagpas, mga magkano ang target budget mo?";
-  if (!qual.location) return "Nationwide tayo—saan ka based para ma-match ko sa pinakamalapit?";
-  if (!qual.transmission) return "Automatic, manual, or ok lang kahit alin?";
-  if (!qual.bodyType) return "Body type mo—sedan, 7-seater/MPV/SUV, or van/pickup?";
-  return null;
-}
-
-function welcomeBlock(session) {
-  const firstTime = !session.createdAtTs || isStale(session.createdAtTs);
-  if (firstTime) {
-    return [{
-      type: "text",
-      text: "Hi! 👋 I’m your BentaCars consultant. Ako na bahala mag-match ng best unit—hindi mo na kailangang mag-scroll. Let’s find your car fast."
-    }];
+// simple in-memory session (works on single lambda/container lifetime)
+const SESSIONS = globalThis.__SESSIONS || (globalThis.__SESSIONS = new Map());
+function getSession(psid) {
+  const now = Date.now();
+  let s = SESSIONS.get(psid);
+  if (!s) {
+    s = { createdAtTs: now, phase: 'phase1', qualifier: {}, funnel: {} };
+    SESSIONS.set(psid, s);
   }
+  // TTL
+  const ttl = MEMORY_TTL_DAYS * 24 * 60 * 60 * 1000;
+  if (!s.createdAtTs || (now - s.createdAtTs) > ttl) {
+    s = { createdAtTs: now, phase: 'phase1', qualifier: {}, funnel: {} };
+    SESSIONS.set(psid, s);
+  }
+  return s;
+}
+
+function sessionReset(psid) {
+  const s = { createdAtTs: Date.now(), phase: 'phase1', qualifier: {}, funnel: {} };
+  SESSIONS.set(psid, s);
+  return s;
+}
+
+async function welcomeBlock(session, isReturning) {
+  if (!isReturning) {
+    const t = await nlg(
+      "Hi! 👋 I’m your BentaCars consultant. Ako na bahala mag-match ng best unit para sa’yo—no need mag-scroll nang mag-scroll. Let’s find your car, fast.",
+      { persona: "friendly" }
+    );
+    return [{ type: 'text', text: t }];
+  }
+  const txt = await nlg("Welcome back! 😊 Itutuloy natin kung saan tayo huli, or start over?", { persona: "friendly" });
   return [{
-    type: "buttons",
-    text: "Welcome back! 😊 Itutuloy natin kung saan tayo huli, or start over?",
+    type: 'buttons',
+    text: txt,
     buttons: [
-      { title: "Continue", payload: "CONTINUE" },
-      { title: "Start over", payload: "START_OVER" }
-    ]
+      { title: 'Continue', payload: 'CONTINUE' },
+      { title: 'Start over', payload: 'START_OVER' },
+    ],
   }];
 }
 
-async function deliver(psid, out = []) {
-  for (const m of out) {
-    if (m.type === "text") await sendText(psid, m.text);
-    else if (m.type === "buttons") await sendButtons(psid, m.text, m.buttons);
-    else if (m.type === "image") await sendImage(psid, m.url);
-    else if (m.type === "carousel") await sendCarousel(psid, m.elements);
+export async function handleMessage({ psid, text, raw, attachments, postback }) {
+  const userText = (text || "").trim();
+  const payload = (postback?.payload || "").toString();
+
+  let session = getSession(psid);
+
+  // Start-over / Continue handling (returning users)
+  if (/^START_OVER$/.test(payload) || /^start over$/i.test(userText)) {
+    session = sessionReset(psid);
   }
-}
-
-export async function handleMessage({ psid, text, raw, attachments }) {
-  await sendTypingOn(psid);
-
-  // load session
-  const now = Date.now();
-  let session = SESS.get(psid) || {
-    createdAtTs: now,
-    phase: "phase1",
-    qualifier: {},
-    funnel: {}
-  };
-
-  // navigation buttons
-  const payload = (raw?.postback?.payload || "").toString();
-  if (payload === "START_OVER") {
-    session = { createdAtTs: now, phase: "phase1", qualifier: {}, funnel: {} };
-  } else if (payload === "CONTINUE") {
-    // keep session as is
+  if (/^CONTINUE$/.test(payload)) {
+    // proceed with current session state
   }
 
-  const out = [];
-
-  // Phase 1: welcome + collect qualifiers
-  if (session.phase === "phase1") {
+  // Phase 1
+  if (session.phase === 'phase1') {
     if (!session._welcomed) {
-      out.push(...welcomeBlock(session));
+      const isReturning = !!session._hadInteraction;
+      const msgs = await welcomeBlock(session, isReturning);
+      await flushMessages(psid, msgs);
       session._welcomed = true;
+      session._hadInteraction = true;
+      // fall-through to absorb same-turn text
     }
 
-    // absorb any info from this turn
-    if (text) session.qualifier = Qualifier.absorb(session.qualifier, text);
+    if (userText) {
+      session.qualifier = Qualifier.absorb(session.qualifier, userText);
+    }
 
-    if (needPhase1(session.qualifier)) {
-      const ask = shortAskForMissing(session.qualifier);
-      const prompt = `User said: "${text}". We need to ask ONLY this missing item in a warm Taglish line: "${ask}"`;
-      const nlg = await nlgLine(prompt, ask);
-      out.push({ type: "text", text: nlg });
-      await deliver(psid, out);
-      SESS.set(psid, session);
-      await sendTypingOff(psid);
+    if (Qualifier.needPhase1(session.qualifier)) {
+      const ask = Qualifier.shortAskForMissing(session.qualifier);
+      const toned = await nlg(ask, { persona: "friendly" });
+      await sendText(psid, toned);
       return;
     }
 
-    // summarize then move to phase2
+    // Completed Phase 1 → move Phase 2
     const sum = Qualifier.summary(session.qualifier);
-    out.push({ type: "text", text: `Alright, ito’ng hahanapin ko for you:\n${sum}\nSaglit, I’ll pull the best units that fit this. 🔎` });
-    session.phase = "phase2";
+    const preface = await nlg(
+      `Got it. ✅ Here’s what I’ll match:\n• ${sum}\nIche-check ko ang inventory, then ibabalik ko 2 options na swak.`,
+      { persona: "friendly" }
+    );
+    await sendText(psid, preface);
+
+    session.phase = 'phase2';
   }
 
-  // Phase 2: offers
-  if (session.phase === "phase2") {
-    const step = await Offers.step(session, text, raw);
-    out.push(...step.messages);
-    session = step.session;
+  // Phase 2 — offers
+  if (session.phase === 'phase2') {
+    try {
+      const step = await Offers(session, userText, raw);
+      session = step.session;
+      await flushMessages(psid, step.messages);
 
-    if (session.nextPhase === "cash") session.phase = "cash";
-    else if (session.nextPhase === "financing") session.phase = "financing";
-    else {
-      await deliver(psid, out);
-      SESS.set(psid, session);
-      await sendTypingOff(psid);
+      if (session.nextPhase === 'cash') {
+        session.phase = 'cash';
+        await sendText(psid, await nlg("Noted — cash path tayo. (Phase 3A stub here)", { persona: "friendly" }));
+        return;
+      } else if (session.nextPhase === 'financing') {
+        session.phase = 'financing';
+        await sendText(psid, await nlg("Financing path tayo. (Phase 3B stub here)", { persona: "friendly" }));
+        return;
+      }
+      return;
+    } catch (err) {
+      console.error("offers step error", err);
+      await sendText(psid, "⚠️ Nagka-issue sa inventory. Try ulit after a moment or adjust filters (e.g., “SUV AT ₱800k QC”).");
       return;
     }
   }
 
-  // Phase 3 placeholders (you can wire your own flows)
-  if (session.phase === "cash") {
-    out.push({ type: "text", text: "Proceeding with cash path—iset natin viewing schedule at contact details. 👌" });
-    await deliver(psid, out);
-    SESS.set(psid, session);
-    await sendTypingOff(psid);
+  // Phase 3 stubs
+  if (session.phase === 'cash') {
+    await sendText(psid, "Cash flow stub: schedule viewing → contact → address. (To be implemented)");
     return;
   }
-  if (session.phase === "financing") {
-    out.push({ type: "text", text: "Proceeding with financing path—kuha tayo ng contact details at i-run ko ang approval steps. 👌" });
-    await deliver(psid, out);
-    SESS.set(psid, session);
-    await sendTypingOff(psid);
+  if (session.phase === 'financing') {
+    await sendText(psid, "Financing flow stub: schedule → contact → address → docs. (To be implemented)");
     return;
   }
 
-  // fallback
-  out.push({ type: "text", text: "Sige, tuloy lang tayo. Cash or financing ang plan mo?" });
-  await deliver(psid, out);
-  SESS.set(psid, session);
-  await sendTypingOff(psid);
+  // Fallback
+  await sendText(psid, "Sige, tuloy lang tayo. Cash or financing ang plan mo para ma-match ko properly?");
 }
-
-export default { handleMessage };
