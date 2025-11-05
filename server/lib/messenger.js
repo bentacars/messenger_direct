@@ -1,128 +1,101 @@
-// /server/lib/messenger.js
-// Facebook Send API helpers + typing + optional profile lookup
+// Minimal FB Send API helpers + safe profile lookup
 
-const GRAPH = "https://graph.facebook.com/v19.0";
-const PAGE_ACCESS_TOKEN =
-  process.env.PAGE_ACCESS_TOKEN ||
-  process.env.FB_PAGE_TOKEN ||
-  process.env.PAGE_TOKEN ||
-  "";
+const PAGE_TOKEN = process.env.PAGE_ACCESS_TOKEN || process.env.FB_PAGE_TOKEN || "";
 
-function fetchJSON(url, opts = {}) {
-  return fetch(url, opts).then(async r => {
-    const text = await r.text();
-    let json;
-    try { json = JSON.parse(text); } catch { json = null; }
-    if (!r.ok) {
-      console.error("Send API error:", r.status, text);
-      throw new Error(text || `HTTP ${r.status}`);
-    }
-    return json ?? {};
+const FB_URL = "https://graph.facebook.com/v17.0/me/messages";
+const PROFILE_URL = (psid) => `https://graph.facebook.com/v17.0/${psid}?fields=first_name,last_name&access_token=${encodeURIComponent(PAGE_TOKEN)}`;
+
+async function fbFetch(url, body) {
+  const res = await fetch(url + `?access_token=${encodeURIComponent(PAGE_TOKEN)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
   });
+  const text = await res.text();
+  if (!res.ok) {
+    console.error("Send API error:", res.status, text);
+  }
+  return { ok: res.ok, status: res.status, body: text };
 }
 
 export async function sendTypingOn(psid) {
-  if (!PAGE_ACCESS_TOKEN) return;
-  const url = `${GRAPH}/me/messages?access_token=${encodeURIComponent(PAGE_ACCESS_TOKEN)}`;
-  await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ recipient: { id: psid }, sender_action: "typing_on" })
-  }).catch(() => {});
+  if (!PAGE_TOKEN) return;
+  await fbFetch(FB_URL, { recipient: { id: psid }, sender_action: "typing_on" });
 }
-
 export async function sendTypingOff(psid) {
-  if (!PAGE_ACCESS_TOKEN) return;
-  const url = `${GRAPH}/me/messages?access_token=${encodeURIComponent(PAGE_ACCESS_TOKEN)}`;
-  await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ recipient: { id: psid }, sender_action: "typing_off" })
-  }).catch(() => {});
+  if (!PAGE_TOKEN) return;
+  await fbFetch(FB_URL, { recipient: { id: psid }, sender_action: "typing_off" });
 }
-
-async function sendPayload(psid, message) {
-  if (!PAGE_ACCESS_TOKEN) throw new Error("PAGE_ACCESS_TOKEN missing");
-  const url = `${GRAPH}/me/messages?access_token=${encodeURIComponent(PAGE_ACCESS_TOKEN)}`;
-  return fetchJSON(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ recipient: { id: psid }, message })
-  });
-}
-
-// High-level senders
 
 export async function sendText(psid, text) {
-  return sendPayload(psid, { text });
-}
-
-export async function sendImage(psid, url) {
-  return sendPayload(psid, { attachment: { type: "image", payload: { url, is_reusable: true } }});
+  if (!PAGE_TOKEN) return;
+  return fbFetch(FB_URL, {
+    recipient: { id: psid },
+    messaging_type: "RESPONSE",
+    message: { text }
+  });
 }
 
 export async function sendButtons(psid, text, buttons = []) {
-  const elems = buttons.map(b => ({
+  if (!PAGE_TOKEN) return;
+  const payloadButtons = buttons.map(b => ({
     type: "postback",
     title: b.title,
-    payload: b.payload
+    payload: b.payload || b.title
   }));
-  return sendPayload(psid, {
-    attachment: {
-      type: "template",
-      payload: {
-        template_type: "button",
-        text,
-        buttons: elems
+  return fbFetch(FB_URL, {
+    recipient: { id: psid },
+    message: {
+      attachment: {
+        type: "template",
+        payload: {
+          template_type: "button",
+          text,
+          buttons: payloadButtons
+        }
       }
     }
   });
 }
 
+export async function sendImage(psid, url) {
+  if (!PAGE_TOKEN || !url) return;
+  return fbFetch(FB_URL, {
+    recipient: { id: psid },
+    message: {
+      attachment: { type: "image", payload: { url, is_reusable: false } }
+    }
+  });
+}
+
+// Generic template carousel
 export async function sendCarousel(psid, elements = []) {
-  // elements: [{title, image_url, subtitle, default_action?}]
-  return sendPayload(psid, {
-    attachment: {
-      type: "template",
-      payload: {
-        template_type: "generic",
-        elements
+  if (!PAGE_TOKEN || !elements.length) return;
+  return fbFetch(FB_URL, {
+    recipient: { id: psid },
+    message: {
+      attachment: {
+        type: "template",
+        payload: { template_type: "generic", elements }
       }
     }
   });
 }
 
-export async function sendMessages(psid, messages = []) {
-  for (const m of messages) {
-    if (!m) continue;
-    if (m.type === "text") await sendText(psid, m.text);
-    else if (m.type === "image") await sendImage(psid, m.url);
-    else if (m.type === "buttons") await sendButtons(psid, m.text, m.buttons || []);
-    else if (m.type === "carousel") await sendCarousel(psid, m.elements || []);
-    else {
-      // unknown → try as text
-      if (m.text) await sendText(psid, m.text);
-    }
-  }
-}
-
-export async function getFirstName(psid) {
+export async function getProfile(psid) {
+  if (!PAGE_TOKEN) return null;
   try {
-    if (!PAGE_ACCESS_TOKEN) return "";
-    const url = `${GRAPH}/${psid}?fields=first_name&access_token=${encodeURIComponent(PAGE_ACCESS_TOKEN)}`;
-    const r = await fetch(url);
-    if (!r.ok) {
-      const t = await r.text();
+    const res = await fetch(PROFILE_URL(psid), { method: "GET" });
+    if (!res.ok) {
+      const t = await res.text();
+      // Don’t crash on (#3) capability errors in dev
       console.warn("Profile API warn:", t);
-      return "";
+      return null;
     }
-    const j = await r.json();
-    return j?.first_name ? String(j.first_name) : "";
-  } catch {
-    return "";
+    const j = await res.json();
+    return j || null;
+  } catch (e) {
+    console.warn("Profile API error:", e?.message || e);
+    return null;
   }
 }
-
-export default {
-  sendTypingOn, sendTypingOff, sendMessages, sendText, sendImage, sendButtons, sendCarousel, getFirstName
-};
