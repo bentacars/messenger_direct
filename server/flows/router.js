@@ -110,14 +110,20 @@ export async function route(session, userText, rawEvent) {
 
   const payload = (rawEvent?.postback?.payload && String(rawEvent.postback.payload)) || '';
 
-  // Quick controls
+  /* --------------------------- Quick controls --------------------------- */
   if (/^start over$/i.test(payload)) {
+    // hard reset but SKIP the welcome UI on purpose
     session.phase = 'phase1';
     session.qualifier = {};
     session.funnel = {};
-    session._welcomed = false;
     session._asked = {};
     session._awaitingResume = false;
+
+    // Important: mark welcomed so we don't show the buttons again this turn
+    session._welcomed = true;
+
+    // Treat as a fresh conversation (prevents "returning" branch)
+    session.createdAtTs = Date.now();
   }
 
   /* --------------------------- Phase 1 --------------------------------- */
@@ -140,13 +146,13 @@ export async function route(session, userText, rawEvent) {
       if (payload === 'CONTINUE') {
         session._awaitingResume = false; // proceed
       } else if (/^start over$/i.test(payload)) {
-        session._awaitingResume = false; // reset was done above
+        session._awaitingResume = false; // reset handled above
       } else {
         return { session, messages };
       }
     }
 
-    // absorb Taglish inputs; extracts multiple values in one message (Qualifier.absorb)
+    // absorb Taglish inputs; extracts multiple values in one message
     if (userText) {
       session.qualifier = Qualifier.absorb(session.qualifier, userText);
     }
@@ -214,7 +220,7 @@ export async function route(session, userText, rawEvent) {
   return { session, messages };
 }
 
-/* -------- Optional shim: keep compatibility if code expects handleMessage --- */
+/* -------- Optional shim: compatibility if code expects handleMessage ----- */
 export async function handleMessage({ psid, text, raw }) {
   if (!globalThis.__SESS) globalThis.__SESS = new Map();
   const sess = globalThis.__SESS.get(psid) ?? { psid };
