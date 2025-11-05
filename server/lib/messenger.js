@@ -1,84 +1,125 @@
-// api/lib/messenger.js
-// Minimal FB Messenger sender helpers (Graph API v18+)
+// /server/lib/messenger.js
+// Minimal Messenger helpers: send, typing, and user profile lookup
 
 const PAGE_TOKEN = process.env.FB_PAGE_TOKEN || '';
+const GRAPH_BASE = process.env.FB_GRAPH_BASE || 'https://graph.facebook.com/v19.0';
 
-function assertToken() {
-  if (!PAGE_TOKEN) throw new Error('FB_PAGE_TOKEN is missing');
-}
-function isValidPsid(psid) {
-  return typeof psid === 'string' && /^[0-9]{5,}$/.test(psid);
-}
-export function validatePsid(psid) {
-  if (!isValidPsid(psid)) {
-    throw new Error(`Invalid PSID: "${String(psid)}"`);
-  }
+if (!PAGE_TOKEN) {
+  console.warn('[messenger] FB_PAGE_TOKEN is missing');
 }
 
-async function fbSend(body) {
-  assertToken();
-  const url = `https://graph.facebook.com/v18.0/me/messages?access_token=${encodeURIComponent(PAGE_TOKEN)}`;
-  const r = await fetch(url, {
+/* -------------------- Low-level Send API -------------------- */
+async function callSendAPI(body) {
+  const url = `${GRAPH_BASE}/me/messages?access_token=${encodeURIComponent(PAGE_TOKEN)}`;
+  const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    body: JSON.stringify(body)
   });
-  if (!r.ok) {
-    const text = await r.text().catch(() => '');
-    throw new Error(`FB send error ${r.status} ${text}`);
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    console.error('Send API error:', res.status, errText);
+    throw new Error(`Send API ${res.status}`);
   }
-  return r.json().catch(() => ({}));
+  return res.json();
 }
 
+/* -------------------- Typing indicators -------------------- */
 export async function sendTypingOn(psid) {
-  validatePsid(psid);
-  return fbSend({ recipient: { id: psid }, sender_action: 'typing_on' });
+  if (!psid) return;
+  return callSendAPI({ recipient: { id: psid }, sender_action: 'typing_on' });
 }
 export async function sendTypingOff(psid) {
-  validatePsid(psid);
-  return fbSend({ recipient: { id: psid }, sender_action: 'typing_off' });
+  if (!psid) return;
+  return callSendAPI({ recipient: { id: psid }, sender_action: 'typing_off' });
 }
-export async function sendText(psid, text, quickReplies /* optional */) {
-  validatePsid(psid);
-  const message = { text };
-  if (Array.isArray(quickReplies) && quickReplies.length) {
-    message.quick_replies = quickReplies.slice(0, 11).map((t) => ({
-      content_type: 'text',
-      title: String(t).slice(0, 20),
-      payload: `QR::${t}`,
-    }));
-  }
-  return fbSend({ recipient: { id: psid }, message });
-}
-export async function sendImage(psid, imageUrl) {
-  validatePsid(psid);
-  return fbSend({
+
+/* -------------------- Message helpers used by webhook -------------------- */
+export async function sendText(psid, text) {
+  if (!psid || !text) return;
+  return callSendAPI({
     recipient: { id: psid },
-    message: {
-      attachment: {
-        type: 'image',
-        payload: { url: imageUrl, is_reusable: true },
-      },
-    },
+    messaging_type: 'RESPONSE',
+    message: { text }
+  });
+}
+export async function sendImage(psid, url) {
+  if (!psid || !url) return;
+  return callSendAPI({
+    recipient: { id: psid },
+    messaging_type: 'RESPONSE',
+    message: { attachment: { type: 'image', payload: { url, is_reusable: false } } }
   });
 }
 export async function sendButtons(psid, text, buttons) {
-  validatePsid(psid);
-  return fbSend({
+  if (!psid || !text) return;
+  return callSendAPI({
     recipient: { id: psid },
+    messaging_type: 'RESPONSE',
     message: {
       attachment: {
         type: 'template',
-        payload: {
-          template_type: 'button',
-          text,
-          buttons: buttons.slice(0, 3).map((b) => ({
-            type: 'postback',
-            title: b.title.slice(0, 20),
-            payload: b.payload.slice(0, 100),
-          })),
-        },
-      },
-    },
+        payload: { template_type: 'button', text, buttons }
+      }
+    }
   });
 }
+export async function sendGenericTemplate(psid, elements) {
+  if (!psid || !elements?.length) return;
+  return callSendAPI({
+    recipient: { id: psid },
+    messaging_type: 'RESPONSE',
+    message: {
+      attachment: {
+        type: 'template',
+        payload: { template_type: 'generic', elements }
+      }
+    }
+  });
+}
+
+/* -------------------- User Profile API (name lookup) -------------------- */
+/**
+ * Returns { first_name, last_name, profile_pic } or null.
+ * Works in Development for app/page roles + testers; in Live for everyone.
+ */
+const _profileCache = new Map(); // psid -> { data, ts }
+const CACHE_MS = 24 * 60 * 60 * 1000; // 24h
+
+export async function getUserProfile(psid) {
+  if (!psid) return null;
+  const hit = _profileCache.get(psid);
+  if (hit && Date.now() - hit.ts < CACHE_MS) return hit.data;
+
+  const url = `${GRAPH_BASE}/${encodeURIComponent(psid)}?fields=first_name,last_name,profile_pic&access_token=${encodeURIComponent(PAGE_TOKEN)}`;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) {
+      // common causes: invalid token, user not eligible in dev mode
+      const t = await res.text().catch(() => '');
+      console.warn('Profile API warn:', res.status, t);
+      return null;
+    }
+    const j = await res.json();
+    const data = {
+      first_name: j.first_name || '',
+      last_name: j.last_name || '',
+      profile_pic: j.profile_pic || ''
+    };
+    _profileCache.set(psid, { data, ts: Date.now() });
+    return data;
+  } catch (e) {
+    console.warn('Profile API error:', e?.message || e);
+    return null;
+  }
+}
+
+export default {
+  sendTypingOn,
+  sendTypingOff,
+  sendText,
+  sendImage,
+  sendButtons,
+  sendGenericTemplate,
+  getUserProfile,
+};
