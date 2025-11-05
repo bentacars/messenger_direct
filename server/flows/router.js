@@ -1,137 +1,78 @@
-// /server/flows/router.js
-// Central conversation router: Phase 1 → Phase 2 → Phase 3 (cash/financing stubs)
-
-import * as Qualifier from './qualifier.js';
+// server/flows/router.js
+import { sendText, sendTypingOn, sendTypingOff } from '../lib/messenger.js';
+import Qualifier from './qualifier.js';
 import Offers from './offers.js';
-import { sendText, sendButtons, flushMessages } from '../lib/messenger.js';
-import { nlg } from '../lib/ai.js';
+import { SESSION_TTL_MS } from '../constants.js';
 
-const MEMORY_TTL_DAYS = Number(process.env.MEMORY_TTL_DAYS || 7);
+const sessions = new Map(); // psid -> { qualifier, history, ... , ts }
 
-// simple in-memory session (works on single lambda/container lifetime)
-const SESSIONS = globalThis.__SESSIONS || (globalThis.__SESSIONS = new Map());
 function getSession(psid) {
   const now = Date.now();
-  let s = SESSIONS.get(psid);
-  if (!s) {
-    s = { createdAtTs: now, phase: 'phase1', qualifier: {}, funnel: {} };
-    SESSIONS.set(psid, s);
-  }
-  // TTL
-  const ttl = MEMORY_TTL_DAYS * 24 * 60 * 60 * 1000;
-  if (!s.createdAtTs || (now - s.createdAtTs) > ttl) {
-    s = { createdAtTs: now, phase: 'phase1', qualifier: {}, funnel: {} };
-    SESSIONS.set(psid, s);
+  let s = sessions.get(psid);
+  if (!s || (now - (s.ts || 0)) > SESSION_TTL_MS) {
+    s = { psid, qualifier: {}, history: [], ts: now };
+    sessions.set(psid, s);
+  } else {
+    s.ts = now;
   }
   return s;
 }
 
-function sessionReset(psid) {
-  const s = { createdAtTs: Date.now(), phase: 'phase1', qualifier: {}, funnel: {} };
-  SESSIONS.set(psid, s);
-  return s;
+function isPostback(raw, payloadStarts) {
+  const p = raw?.postback?.payload || '';
+  return payloadStarts.some(x => p.startsWith(x));
 }
 
-async function welcomeBlock(session, isReturning) {
-  if (!isReturning) {
-    const t = await nlg(
-      "Hi! 👋 I’m your BentaCars consultant. Ako na bahala mag-match ng best unit para sa’yo—no need mag-scroll nang mag-scroll. Let’s find your car, fast.",
-      { persona: "friendly" }
-    );
-    return [{ type: 'text', text: t }];
-  }
-  const txt = await nlg("Welcome back! 😊 Itutuloy natin kung saan tayo huli, or start over?", { persona: "friendly" });
-  return [{
-    type: 'buttons',
-    text: txt,
-    buttons: [
-      { title: 'Continue', payload: 'CONTINUE' },
-      { title: 'Start over', payload: 'START_OVER' },
-    ],
-  }];
-}
+export async function handleMessage({ psid, text, raw }) {
+  const session = getSession(psid);
 
-export async function handleMessage({ psid, text, raw, attachments, postback }) {
-  const userText = (text || "").trim();
-  const payload = (postback?.payload || "").toString();
+  // Normalize user text from postbacks
+  let userText = text || '';
+  if (raw?.postback?.payload) userText = raw.postback.payload;
 
-  let session = getSession(psid);
-
-  // Start-over / Continue handling (returning users)
-  if (/^START_OVER$/.test(payload) || /^start over$/i.test(userText)) {
-    session = sessionReset(psid);
-  }
-  if (/^CONTINUE$/.test(payload)) {
-    // proceed with current session state
-  }
-
-  // Phase 1
-  if (session.phase === 'phase1') {
-    if (!session._welcomed) {
-      const isReturning = !!session._hadInteraction;
-      const msgs = await welcomeBlock(session, isReturning);
-      await flushMessages(psid, msgs);
-      session._welcomed = true;
-      session._hadInteraction = true;
-      // fall-through to absorb same-turn text
-    }
-
-    if (userText) {
-      session.qualifier = Qualifier.absorb(session.qualifier, userText);
-    }
-
-    if (Qualifier.needPhase1(session.qualifier)) {
-      const ask = Qualifier.shortAskForMissing(session.qualifier);
-      const toned = await nlg(ask, { persona: "friendly" });
-      await sendText(psid, toned);
-      return;
-    }
-
-    // Completed Phase 1 → move Phase 2
-    const sum = Qualifier.summary(session.qualifier);
-    const preface = await nlg(
-      `Got it. ✅ Here’s what I’ll match:\n• ${sum}\nIche-check ko ang inventory, then ibabalik ko 2 options na swak.`,
-      { persona: "friendly" }
-    );
-    await sendText(psid, preface);
-
-    session.phase = 'phase2';
-  }
-
-  // Phase 2 — offers
-  if (session.phase === 'phase2') {
-    try {
-      const step = await Offers(session, userText, raw);
-      session = step.session;
-      await flushMessages(psid, step.messages);
-
-      if (session.nextPhase === 'cash') {
-        session.phase = 'cash';
-        await sendText(psid, await nlg("Noted — cash path tayo. (Phase 3A stub here)", { persona: "friendly" }));
-        return;
-      } else if (session.nextPhase === 'financing') {
-        session.phase = 'financing';
-        await sendText(psid, await nlg("Financing path tayo. (Phase 3B stub here)", { persona: "friendly" }));
-        return;
-      }
-      return;
-    } catch (err) {
-      console.error("offers step error", err);
-      await sendText(psid, "⚠️ Nagka-issue sa inventory. Try ulit after a moment or adjust filters (e.g., “SUV AT ₱800k QC”).");
-      return;
-    }
-  }
-
-  // Phase 3 stubs
-  if (session.phase === 'cash') {
-    await sendText(psid, "Cash flow stub: schedule viewing → contact → address. (To be implemented)");
-    return;
-  }
-  if (session.phase === 'financing') {
-    await sendText(psid, "Financing flow stub: schedule → contact → address → docs. (To be implemented)");
+  // Restart
+  if (/^START OVER$/i.test(userText)) {
+    sessions.delete(psid);
+    await sendText(psid, 'Sige, start tayo ulit. 😊');
     return;
   }
 
-  // Fallback
-  await sendText(psid, "Sige, tuloy lang tayo. Cash or financing ang plan mo para ma-match ko properly?");
+  // Continue button just acknowledges
+  if (/^CONTINUE$/i.test(userText)) {
+    await sendText(psid, 'Game, itutuloy natin kung saan tayo huli.');
+    return;
+  }
+
+  await sendTypingOn(psid);
+
+  // If user taps any offers postback
+  if (isPostback(raw, ['CHOOSE_', 'PHOTOS_', 'SHOW_OTHERS'])) {
+    const out = await Offers.step(session, userText);
+    if (out?.message) await sendText(psid, out.message);
+    await sendTypingOff(psid);
+    return;
+  }
+
+  // If qualifiers not complete, run LLM qualifier
+  const qualDone = !!(session.qualifier?.payment && session.qualifier?.budget_number && session.qualifier?.location_city && session.qualifier?.transmission && session.qualifier?.body_type);
+
+  if (!qualDone) {
+    const out = await Qualifier.step(session, userText, raw);
+    if (out?.message) await sendText(psid, out.message);
+    // If done, immediately move to offers
+    if (out?.done) {
+      const o = await Offers.step(session, 'INIT');
+      if (o?.message) await sendText(psid, o.message);
+    }
+    await sendTypingOff(psid);
+    return;
+  }
+
+  // Already qualified → treat message as offers navigation
+  const o = await Offers.step(session, userText);
+  if (o?.message) await sendText(psid, o.message);
+
+  await sendTypingOff(psid);
 }
+
+export const absorb = handleMessage; // for compatibility
