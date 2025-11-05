@@ -1,293 +1,256 @@
-// /server/flows/offers.js
-// Phase 2 — match up to 4 units (Priority → OK to Market), show 2 first; backup 2 on "Others".
-// On pick, send photo CAROUSEL (image_1..image_10) → next phase (cash/financing).
+// Phase 2 — match up to 4 units (Priority → OK to Market), show 2 first,
+// "Others" reveals backup 2. When a unit is chosen, send photo CAROUSEL.
 
-const INVENTORY_API_URL = process.env.INVENTORY_API_URL || "";
+import { sendText, sendButtons, sendImage, sendCarousel } from "../lib/messenger.js";
 
-/* ----------------------- utilities ----------------------- */
-function num(x) {
-  if (x == null || x === "") return NaN;
-  const s = String(x).replace(/[₱,\s]/g, "");
-  const n = Number(s);
-  return Number.isFinite(n) ? n : NaN;
-}
-function norm(s) { return (s || "").toString().trim(); }
-function normLower(s) { return norm(s).toLowerCase(); }
-function isTruthy(v) { return v !== undefined && v !== null && String(v).trim() !== ""; }
+const INVENTORY_API_URL = process.env.INVENTORY_API_URL || process.env.KV_REST_API_URL;
 
-function strongWants(qual = {}) {
+// --- helpers ---
+const toNum = (v) => {
+  const n = Number(String(v || "").replace(/[₱, ]/g, ""));
+  return isFinite(n) ? n : 0;
+};
+
+function qualWants(qual = {}) {
   return {
-    brand: norm(qual.brand),
-    model: norm(qual.model),
-    year: qual.year ? String(qual.year).trim() : "",
-    variant: norm(qual.variant),
-  };
-}
-function hasStrongWants(w = {}) {
-  return !!(w.brand || w.model || w.year || w.variant);
-}
-
-/* ----------------------- inventory I/O ----------------------- */
-async function fetchInventory() {
-  if (!INVENTORY_API_URL) throw new Error("INVENTORY_API_URL missing");
-
-  const headers = {};
-  if (process.env.INVENTORY_API_TOKEN) {
-    headers.Authorization = `Bearer ${process.env.INVENTORY_API_TOKEN}`;
-  }
-
-  const res = await fetch(INVENTORY_API_URL, { method: "GET", headers });
-  const text = await res.text();
-
-  if (!res.ok) throw new Error(`inventory http ${res.status} ${text.slice(0,120)}`);
-
-  let json;
-  try { json = JSON.parse(text); } catch { throw new Error("inventory not JSON"); }
-
-  const rows = Array.isArray(json) ? json
-             : (json && Array.isArray(json.data)) ? json.data
-             : null;
-  if (!Array.isArray(rows)) throw new Error("inventory JSON not array");
-  return rows;
-}
-
-function normalizeRow(r) {
-  const pick = (obj, ...keys) => keys.map(k => obj?.[k]).find(v => v != null);
-
-  return {
-    SKU: norm(pick(r, "SKU", "sku", "Sku")),
-    brand: norm(pick(r, "brand", "Brand")),
-    model: norm(pick(r, "model", "Model")),
-    variant: norm(pick(r, "variant", "Variant")),
-    year: norm(pick(r, "year", "Year")),
-    transmission: normLower(pick(r, "transmission", "Transmission")),
-    body_type: normLower(pick(r, "body_type", "bodyType", "Body Type")),
-    city: norm(pick(r, "city", "City")),
-    province: norm(pick(r, "province", "Province")),
-    ncr_zone: norm(pick(r, "ncr_zone", "ncrZone", "NCR")),
-    color: norm(pick(r, "color", "Color")),
-    mileage: norm(pick(r, "mileage", "Mileage")),
-    complete_address: norm(pick(r, "complete_address", "address", "Address")),
-    price_status: norm(pick(r, "price_status", "Price Status", "status")),
-    srp: num(pick(r, "srp", "SRP", "price", "Price")),
-    all_in: num(pick(r, "all_in", "All-in", "allIn")),
-    images: [
-      r.image_1, r.image_2, r.image_3, r.image_4, r.image_5,
-      r.image_6, r.image_7, r.image_8, r.image_9, r.image_10
-    ].filter(isTruthy).map(norm),
+    payment: (qual.payment || "").toLowerCase(), // cash|financing
+    budget: toNum(qual.budget),
+    location: (qual.location || "").toLowerCase(),
+    trans: (qual.transmission || "").toLowerCase(), // at|mt|any
+    body: (qual.bodyType || "").toLowerCase(),
+    brand: (qual.brand || "").toLowerCase(),
+    model: (qual.model || "").toLowerCase(),
+    year: String(qual.year || "").toLowerCase(),
+    variant: (qual.variant || "").toLowerCase()
   };
 }
 
-/* ----------------------- matching logic ----------------------- */
-function priceMatches(qual, row) {
-  if (!qual?.payment || !isFinite(qual.budget)) return true;
+function isPriority(row) {
+  const s = (row.price_status || "").toLowerCase();
+  return s.includes("priority");
+}
+function isOK(row) {
+  const s = (row.price_status || "").toLowerCase();
+  return s.includes("ok");
+}
 
-  if (qual.payment === "cash") {
-    if (!isFinite(row.srp)) return false;
-    const lo = qual.budget - 50000;
-    const hi = qual.budget + 50000;
-    return row.srp >= lo && row.srp <= hi;
-  }
+function withinCashBudget(row, budget) {
+  if (!budget) return true;
+  const srp = toNum(row.srp || row.dealer_price || 0);
+  return srp >= budget - 50000 && srp <= budget + 50000;
+}
+function withinFinBudget(row, budget) {
+  if (!budget) return true;
+  const allin = toNum(row.all_in || 0);
+  return allin <= budget + 50000;
+}
 
-  if (qual.payment === "financing") {
-    if (isFinite(row.all_in)) return row.all_in <= (qual.budget + 50000);
-    // Optional fallback if all_in missing: very coarse filter using SRP
-    if (isFinite(row.srp)) return row.srp <= (qual.budget + 50000);
-    return false;
-  }
-
+function matchesStrong(row, w) {
+  if (w.brand && String(row.brand || "").toLowerCase() !== w.brand) return false;
+  if (w.model && String(row.model || "").toLowerCase() !== w.model) return false;
+  if (w.variant && !String(row.variant || "").toLowerCase().includes(w.variant)) return false;
+  if (w.year && String(row.year || "").toLowerCase() !== w.year) return false;
   return true;
 }
 
-function fieldMatches(qual, row) {
-  if (qual.location) {
-    const q = normLower(qual.location);
-    const rCity = normLower(row.city);
-    const rProv = normLower(row.province);
-    const rZone = normLower(row.ncr_zone);
-    if (q && !(rCity.includes(q) || rProv.includes(q) || rZone.includes(q))) return false;
+function matchesPhase1(row, w) {
+  // Transmission "any" means ignore, else check
+  if (w.trans && w.trans !== "any") {
+    const t = String(row.transmission || "").toLowerCase();
+    const wantAT = ["a/t", "at", "automatic"];
+    const wantMT = ["m/t", "mt", "manual"];
+    if (w.trans.startsWith("a") && !wantAT.some(s => t.includes(s))) return false;
+    if (w.trans.startsWith("m") && !wantMT.some(s => t.includes(s))) return false;
   }
-  if (qual.transmission && qual.transmission !== "any") {
-    if (row.transmission && row.transmission !== qual.transmission.toLowerCase()) return false;
-  }
-  if (qual.bodyType && qual.bodyType !== "any") {
-    if (row.body_type && row.body_type !== qual.bodyType.toLowerCase()) return false;
+  if (w.body && w.body !== "any") {
+    const b = String(row.body_type || row.bodyType || "").toLowerCase();
+    if (b && !b.includes(w.body)) return false;
   }
   return true;
 }
 
-function strongWantsMatches(qual, row) {
-  const want = strongWants(qual);
-  if (!hasStrongWants(want)) return true;
-
-  const b = normLower(row.brand);
-  const m = normLower(row.model);
-  const v = normLower(row.variant);
-  const y = (row.year || "").toString().trim();
-
-  if (want.brand && normLower(want.brand) !== b) return false;
-  if (want.model && normLower(want.model) !== m) return false;
-  if (want.variant && normLower(want.variant) !== v) return false;
-  if (want.year && want.year !== y) return false;
-  return true;
-}
-
-function rankPool(pool) {
-  const score = (r) =>
-    r.price_status?.toLowerCase()?.includes("priority") ? 2 :
-    r.price_status?.toLowerCase()?.includes("ok") ? 1 : 0;
-  return pool.slice().sort((a, b) => score(b) - score(a));
-}
-
-/* ----------------------- formatting ----------------------- */
 function quickHook(row) {
-  const mdl = normLower(row.model);
-  if (/vios/.test(mdl)) return "Matipid sa gas, mura maintenance";
-  if (/mirage/.test(mdl)) return "3-cyl → super tipid sa gas";
-  if (/innova/.test(mdl)) return "7-seater, pang-pamilya, diesel tipid";
-  if (/everest|fortuner|terra/.test(mdl)) return "Malakas hatak, mataas ground clearance";
-  return "Good condition, ready for viewing";
+  const m = String(row.model || "").toLowerCase();
+  if (m.includes("vios")) return "Matipid, mura maintenance ✅";
+  if (m.includes("mirage")) return "3-cyl → super tipid sa gas ✅";
+  if (m.includes("innova")) return "7-seater, pang-pamilya ✅";
+  if (m.includes("everest")) return "Mataas ground clearance, malakas hatak ✅";
+  return "Good condition, ready for viewing ✅";
 }
-function titleLine(row) {
-  const yr = row.year ? `${row.year} ` : "";
-  const varLine = row.variant ? ` ${row.variant}` : "";
-  return `${yr}${row.brand} ${row.model}${varLine}`.trim();
-}
-function priceLine(qual, row) {
-  if (qual.payment === "financing") {
-    if (isFinite(row.all_in)) return `All-in: ₱${row.all_in.toLocaleString()} (subject for approval)`;
-    return `All-in available (subject for approval)`;
+
+function imagesOf(row) {
+  const imgs = [];
+  for (let i = 1; i <= 10; i++) {
+    const u = row[`image_${i}`];
+    if (u && /^https?:\/\//i.test(u)) imgs.push(u);
   }
-  if (isFinite(row.srp)) return `SRP: ₱${row.srp.toLocaleString()} (negotiable upon viewing)`;
-  return "SRP available onsite";
+  return imgs;
 }
-function unitCard(qual, row, indexLabel) {
-  const img = row.images[0] || null;
-  const loc = [row.city, row.province].filter(Boolean).join(" — ");
-  const text = [
-    titleLine(row),
-    row.mileage ? `${row.mileage} km — ${loc || "Metro Manila"}` : `${loc || "Metro Manila"}`,
-    priceLine(qual, row),
-    `${quickHook(row)} ✅`
-  ].join("\n");
 
-  const buttons = [
-    { title: indexLabel, payload: `CHOOSE_${row.SKU || indexLabel}` },
-    { title: "Others", payload: "SHOW_OTHERS" }
-  ];
+// Build pool (max 4) honoring Priority→OK and strong wants
+async function buildPool(qual) {
+  const w = qualWants(qual);
 
-  const msgs = [];
-  if (img) msgs.push({ type: "image", url: img });
-  msgs.push({ type: "buttons", text, buttons });
-  return msgs;
-}
-function toCarouselElements(row) {
-  const els = [];
-  for (const url of row.images) {
-    els.push({
-      title: titleLine(row),
-      image_url: url,
-      subtitle: row.complete_address || "",
-      default_action: { type: "web_url", url }
-    });
+  const res = await fetch(INVENTORY_API_URL);
+  const data = await res.json(); // expect array of rows with headers provided
+
+  const base = Array.isArray(data) ? data : (data?.rows || []);
+  const items = base.filter(Boolean);
+
+  const priced = items.filter(row => {
+    if (w.payment === "cash") return withinCashBudget(row, w.budget);
+    return withinFinBudget(row, w.budget);
+  }).filter(row => matchesPhase1(row, w));
+
+  const strong = priced.filter(r => matchesStrong(r, w));
+  const loose  = priced.filter(r => !matchesStrong(r, w));
+
+  function sortTier(list) {
+    const pri = list.filter(isPriority);
+    const ok  = list.filter(r => !isPriority(r) && isOK(r));
+    const rest = list.filter(r => !pri.includes(r) && !ok.includes(r));
+    return [...pri, ...ok, ...rest];
   }
-  return els.slice(0, 10);
+
+  const ordered = [...sortTier(strong), ...sortTier(loose)];
+  return ordered.slice(0, 4);
 }
 
-/* ----------------------- main step ----------------------- */
+// Format single card text
+function unitLine(row, payment) {
+  const loc = [row.city, row.province || row.ncr_zone].filter(Boolean).join(", ");
+  const km = row.mileage ? `${row.mileage} km — ` : "";
+  if (payment === "cash") {
+    const srp = toNum(row.srp) || toNum(row.dealer_price);
+    return [
+      `${row.year || ""} ${row.brand || ""} ${row.model || ""} ${row.variant || ""}`.replace(/\s+/g, " ").trim(),
+      `${km}${loc}`,
+      `SRP: ₱${(srp || 0).toLocaleString()} (negotiable upon viewing)`,
+      quickHook(row)
+    ].join("\n");
+  } else {
+    const range = row.all_in ? `₱${toNum(row.all_in).toLocaleString()}` : "Ask all-in";
+    return [
+      `${row.year || ""} ${row.brand || ""} ${row.model || ""} ${row.variant || ""}`.replace(/\s+/g, " ").trim(),
+      `${km}${loc}`,
+      `All-in: ${range} (subject for approval)`,
+      "Standard 20–30% DP, may promo all-in ✅"
+    ].join("\n");
+  }
+}
+
+function elementFor(row, idx) {
+  const title = `${row.year || ""} ${row.brand || ""} ${row.model || ""}`.replace(/\s+/g, " ").trim();
+  const subtitle = quickHook(row);
+  const img = imagesOf(row)[0] || row.image_1 || row.image_2;
+  return {
+    title: title || "Unit",
+    image_url: img || undefined,
+    subtitle,
+    buttons: [
+      { type: "postback", title: `Unit ${idx}`, payload: `CHOOSE_${idx}` }
+    ]
+  };
+}
+
 export async function step(session, userText, rawEvent) {
   const messages = [];
-  const payload = (rawEvent?.postback?.payload && String(rawEvent.postback.payload)) || "";
-  const pickPayload = payload.startsWith("CHOOSE_") ? payload : null;
-  const wantMorePhotos = /\b(more|photos|pictures|lahat|imgs|gallery|pics)\b/i.test(String(userText || ""));
-
   session.funnel = session.funnel || {};
-  session.offers = session.offers || { page: 0, pool: [], tier: "" };
-  const qual = session.qualifier || {};
+  session.offers = session.offers || { pool: [], page: 0 };
 
-  // paginate with "Others"
-  if (/^SHOW_OTHERS$/i.test(payload)) {
-    session.offers.page = (session.offers.page || 0) + 1;
-  }
+  const payload = (rawEvent?.postback?.payload || "").toString();
+  const wantMorePhotos =
+    /\b(more|photos|images|lahat|tingin|shots|gallery)\b/i.test(String(userText || ""));
 
-  // build pool if empty
-  let pool = session.offers.pool || [];
-  if (!pool.length) {
-    let rows, error = null;
-    try {
-      const raw = await fetchInventory();
-      rows = raw.map(normalizeRow);
-    } catch (e) {
-      error = e?.message || e;
-    }
-    if (error) {
-      messages.push({ type: "text", text: `⚠️ Nagka-issue sa inventory: ${error}. Try ulit after a moment or adjust filters (e.g., “SUV AT ₱800k QC”).` });
+  // Handle CHOOSE_X → send gallery (carousel if possible)
+  if (/^CHOOSE_\d+/.test(payload)) {
+    const idx = Number(payload.split("_")[1]) - 1;
+    const unit = session.offers.pool[idx];
+    if (!unit) {
+      messages.push({ type: "text", text: "Medyo nawala ‘yung item na ‘yon. Pwede pili ka ulit? 😊" });
       return { session, messages };
     }
 
-    const filtered = rows.filter(row =>
-      priceMatches(qual, row) &&
-      fieldMatches(qual, row) &&
-      strongWantsMatches(qual, row)
-    );
+    messages.push({ type: "text", text: "Solid choice! 🔥 Sending full photos…" });
 
-    pool = rankPool(filtered).slice(0, 4);
-    session.offers.pool = pool;
+    const imgs = imagesOf(unit);
+    if (imgs.length >= 2) {
+      // build carousel elements from images
+      const elements = imgs.slice(0, 10).map((u, i) => ({
+        title: i === 0 ? "Front / Angle" : `Photo ${i + 1}`,
+        image_url: u
+      }));
+      messages.push({ type: "carousel", elements });
+    } else if (imgs.length === 1) {
+      messages.push({ type: "image", url: imgs[0] });
+    } else {
+      messages.push({ type: "text", text: "Walang uploaded gallery, pero pwede tayo mag viewing. 😊" });
+    }
+
+    // Next phase hint (router will switch)
+    session.nextPhase = (session.qualifier?.payment === "cash") ? "cash" : "financing";
+    return { session, messages };
+  }
+
+  // "Others" → next page
+  if (/^SHOW_OTHERS/.test(payload) || /^others$/i.test(String(userText || ""))) {
+    session.offers.page = (session.offers.page || 0) + 1;
+  }
+
+  // First time in phase2 → build pool
+  if (!session.offers.pool?.length) {
+    let pool = [];
+    try {
+      pool = await buildPool(session.qualifier || {});
+    } catch (e) {
+      messages.push({ type: "text", text: `⚠️ Nagka-issue sa inventory: ${e?.message || e}. Subukan natin ulit mamaya o bawasan natin ang filters.` });
+      return { session, messages };
+    }
+
+    if (!pool.length) {
+      messages.push({ type: "text", text: "Walang exact match sa filters na ‘to. Pwede kitang i-tryhan ng alternatives — type mo “Others”. 🙂" });
+      return { session, messages };
+    }
+
+    session.offers.pool = pool.slice(0, 4);
     session.offers.page = 0;
   }
 
-  if (!pool.length) {
-    messages.push({ type: "text", text: "Walang exact match sa filters na ’to. Pwede kitang i-tryhan ng alternatives — type mo “Others”." });
-    return { session, messages };
-  }
+  // Show 2 per page
+  const start = (session.offers.page || 0) * 2;
+  const slice = session.offers.pool.slice(start, start + 2);
+  const payment = (session.qualifier?.payment || "").toLowerCase();
 
-  // slice 2 per page
-  const PAGE = 2;
-  const start = (session.offers.page || 0) * PAGE;
-  const slice = pool.slice(start, start + PAGE);
-
-  // user picked or asked for photos
-  if (pickPayload || wantMorePhotos) {
-    const sku = pickPayload ? pickPayload.replace(/^CHOOSE_/, "") : null;
-    const chosen = sku
-      ? pool.find(x => (x.SKU && x.SKU === sku) || titleLine(x) === sku) || slice[0]
-      : slice[0];
-
-    session.funnel.unit = {
-      sku: chosen?.SKU || "",
-      label: titleLine(chosen),
-      raw: chosen
-    };
-
-    messages.push({ type: "text", text: "Solid choice! 🔥 Sending full photos…" });
-
-    if (chosen?.images?.length) {
-      const elements = toCarouselElements(chosen);
-      if (elements.length >= 2) {
-        messages.push({ type: "carousel", elements });
-      } else {
-        for (const url of chosen.images) messages.push({ type: "image", url });
-      }
-    }
-
-    session.nextPhase = (qual.payment === "cash") ? "cash" : "financing";
-    return { session, messages };
-  }
-
-  // show 2 (image + buttons each)
   for (let i = 0; i < slice.length; i++) {
     const row = slice[i];
-    const label = i === 0 ? "Unit 1" : "Unit 2";
-    messages.push(...unitCard(qual, row, label));
+    const text = unitLine(row, payment);
+    const img = imagesOf(row)[0];
+    if (img) messages.push({ type: "image", url: img });
+    messages.push({ type: "text", text });
   }
 
-  // hint if there are backups
-  if (start + PAGE < pool.length) {
-    messages.push({
-      type: "buttons",
-      text: "Pili ka or check mo pa yung iba.",
-      buttons: [{ title: "Others", payload: "SHOW_OTHERS" }]
-    });
+  // Buttons row
+  const btns = [];
+  if (slice[0]) btns.push({ title: "Unit 1", payload: "CHOOSE_1" });
+  if (slice[1]) btns.push({ title: "Unit 2", payload: "CHOOSE_2" });
+
+  // If more exist, add Others
+  if (start + 2 < session.offers.pool.length) {
+    btns.push({ title: "Others", payload: "SHOW_OTHERS" });
+  }
+
+  messages.push({ type: "buttons", text: "Pili ka:", buttons: btns });
+
+  // If user typed “photos” on a specific unit name, we could enhance here later.
+  if (wantMorePhotos && slice[0]) {
+    // Send quick gallery for the first visible item
+    const imgs = imagesOf(slice[0]);
+    if (imgs.length >= 2) {
+      const elements = imgs.slice(0, 10).map((u, i) => ({ title: `Photo ${i + 1}`, image_url: u }));
+      messages.push({ type: "carousel", elements });
+    } else if (imgs[0]) {
+      messages.push({ type: "image", url: imgs[0] });
+    }
   }
 
   return { session, messages };
