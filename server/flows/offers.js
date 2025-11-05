@@ -1,6 +1,7 @@
 // /server/flows/offers.js
-// Phase 2 — match up to 4 units (Priority → OK to Market), show 2 first, backup 2 on "Others".
-// When a unit is chosen, send a photo CAROUSEL (image_1..image_10) then move to next phase.
+// Phase 2 — match up to 4 units (Priority → OK to Market).
+// Show 2 first; "Others" reveals the backup 2.
+// When a unit is chosen, send a photo CAROUSEL (image_1..image_10), then move to next phase.
 
 const INVENTORY_API_URL = process.env.INVENTORY_API_URL || '';
 
@@ -18,14 +19,20 @@ export async function step(session, userText, rawEvent) {
   }
 
   const qual = session.qualifier || {};
-  const { pool, error } = await buildPool(qual); // returns up to 4 units in correct tier order
+  const { pool, error } = await buildPool(qual); // up to 4 units, tiered + ranked
 
   if (error) {
-    messages.push({ type: 'text', text: `⚠️ Nagka-issue sa inventory: ${error}. Try ulit after a moment or adjust filters (e.g., “SUV AT ₱800k QC”).` });
+    messages.push({
+      type: 'text',
+      text: `⚠️ Nagka-issue sa inventory: ${error}. Try ulit after a moment or adjust filters (e.g., “SUV AT ₱800k QC”).`
+    });
     return { session, messages };
   }
   if (!pool.length) {
-    messages.push({ type: 'text', text: 'Walang exact match sa filters na ’to. Pwede kitang i-tryhan ng alternatives — type mo “Others”.' });
+    messages.push({
+      type: 'text',
+      text: 'Walang exact match sa filters na ’to. Pwede kitang i-tryhan ng alternatives — type mo “Others”.'
+    });
     return { session, messages };
   }
 
@@ -41,8 +48,8 @@ export async function step(session, userText, rawEvent) {
     slice = session._offers.pool.slice(0, PAGE_SIZE);
   }
 
-  // If user has tapped a Unit or asked for "more photos", send gallery
-  const pickPayload = payload?.startsWith('CHOOSE_') ? payload.replace(/^CHOOSE_/, '') : '';
+  // "More photos" intent OR explicit unit pick
+  const pickPayload = payload && payload.startsWith('CHOOSE_') ? payload.replace(/^CHOOSE_/, '') : '';
   const wantMorePhotos = /^(more\s+(photos|pics|images)|lahat\s+ng\s+photos|gallery)$/i.test(String(userText || '').trim());
 
   if (pickPayload || wantMorePhotos) {
@@ -64,7 +71,7 @@ export async function step(session, userText, rawEvent) {
             ? [{ type: 'web_url', title: 'Details', url: chosen.drive_link }]
             : []
         }));
-        messages.push({ type: 'generic', elements }); // carousel gallery
+        messages.push({ type: 'generic', elements }); // Messenger "generic" carousel
       } else {
         messages.push({ type: 'text', text: 'Walang extra photos uploaded for this unit yet. Pwede kong i-request sa dealer. 🙏' });
       }
@@ -87,7 +94,7 @@ export async function step(session, userText, rawEvent) {
     }
   }
 
-  // Show 2 units as separate messages (not a carousel)
+  // Show 2 units as separate messages (not a product carousel)
   for (const unit of slice) {
     if (unit.image_1) messages.push({ type: 'image', url: unit.image_1 });
 
@@ -109,7 +116,7 @@ export async function step(session, userText, rawEvent) {
   btns.push({ title: 'Others', payload: 'SHOW_OTHERS' });
   messages.push({ type: 'buttons', text: 'Pili ka:', buttons: btns });
 
-  // Allow branch to Phase 3 if user declares payment here (seldom)
+  // Optional branch if user types payment here
   if (payload === 'CASH' || /\bcash\b/.test(t)) {
     session.nextPhase = 'cash';
     messages.push({ type: 'text', text: 'Sige, Cash path tayo. I-schedule natin ang viewing.' });
@@ -123,12 +130,6 @@ export async function step(session, userText, rawEvent) {
 
   return { session, messages };
 }
-
-/* ============================ Pool builder ============================== */
-// - Pulls from INVENTORY_API_URL
-// - Applies strong wants (brand/model/year/variant) as *filters* if present
-// - Applies hidden pricing rules based on payment + budget
-// - Builds up to 4 items total, prioritizing "Priority" tier first, then "OK to Market"
 
 /* ============================ Strong Wants Helpers =========================== */
 // Extract explicit brand/model/year/variant preference from Phase 1
@@ -145,8 +146,10 @@ function hasStrongWants(w = {}) {
 }
 
 /* ============================ Pool builder ============================== */
-async function buildPool(qual) {
-
+// - Pulls from INVENTORY_API_URL
+// - Applies strong wants as filters when present
+// - Applies hidden pricing rules based on payment + budget
+// - Builds up to 4 items total, prioritizing "Priority" tier first, then "OK to Market"
 async function buildPool(qual) {
   if (!INVENTORY_API_URL) return { pool: [], error: 'INVENTORY_API_URL missing' };
   try {
@@ -159,7 +162,7 @@ async function buildPool(qual) {
     const raw = await res.json();
     let items = (Array.isArray(raw) ? raw : raw?.items || []).map(normalizeFromSheet);
 
-    // Strong wants
+    // Strong wants filter
     const want = strongWants(qual);
     if (hasStrongWants(want)) {
       items = items.filter(u =>
@@ -170,7 +173,7 @@ async function buildPool(qual) {
       );
     }
 
-    // Apply hidden Phase-1 pricing rules + soft filters (body/trans/location)
+    // Hidden Phase-1 rules + soft filters
     const filtered = items.filter(u => softPhase1Filter(u, qual));
 
     // Partition by price_status
@@ -178,21 +181,19 @@ async function buildPool(qual) {
     const okm  = filtered.filter(u => isOKtoMarket(u.price_status));
     const rest = filtered.filter(u => !isPriority(u.price_status) && !isOKtoMarket(u.price_status));
 
-    // Score within each tier for ordering
+    // Score within tier
     const order = arr => arr
       .map(u => ({ u, s: scoreUnit(u, qual) }))
       .sort((A, B) => B.s - A.s)
       .map(x => x.u);
 
-    const priOrdered = order(pri);
-    const okmOrdered = order(okm);
-    const restOrdered = order(rest);
+    let a = order(pri);
+    let b = order(okm);
+    let c = order(rest);
 
-    // Build pool: first 2 from Priority (else OKM), then backup 2 from same tier; if underfilled, borrow from the other tier, then 'rest'
-    let pool = [];
+    // Build pool: first 2 from Priority (else OKM), then backup 2 from same tier; if underfilled, borrow others.
+    const pool = [];
     const take = (arr, n) => { const out = arr.slice(0, n); arr.splice(0, n); return out; };
-
-    let a = [...priOrdered], b = [...okmOrdered], c = [...restOrdered];
 
     // first 2
     if (a.length >= 2)      pool.push(...take(a, 2));
@@ -200,19 +201,11 @@ async function buildPool(qual) {
     else                    pool.push(...take(a, 2), ...take(b, 2), ...take(c, 2));
 
     // backup 2
-    if (pool.length < 4) {
-      if (a.length) pool.push(...take(a, Math.min(2, 4 - pool.length)));
-    }
-    if (pool.length < 4) {
-      if (b.length) pool.push(...take(b, Math.min(2, 4 - pool.length)));
-    }
-    if (pool.length < 4 && c.length) {
-      pool.push(...take(c, Math.min(2, 4 - pool.length)));
-    }
+    if (pool.length < 4 && a.length) pool.push(...take(a, Math.min(2, 4 - pool.length)));
+    if (pool.length < 4 && b.length) pool.push(...take(b, Math.min(2, 4 - pool.length)));
+    if (pool.length < 4 && c.length) pool.push(...take(c, Math.min(2, 4 - pool.length)));
 
-    // Cap to 4
-    pool = uniqueBySKU(pool).slice(0, 4);
-    return { pool, error: null };
+    return { pool: uniqueBySKU(pool).slice(0, 4), error: null };
   } catch (e) {
     return { pool: [], error: e.name === 'AbortError' ? 'timeout' : (e.message || 'fetch error') };
   }
@@ -399,3 +392,5 @@ function isOKtoMarket(ps = '') {
   const v = (ps || '').toLowerCase();
   return v.includes('ok') && v.includes('market');
 }
+
+export default { step };
