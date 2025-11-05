@@ -1,10 +1,11 @@
 // /server/flows/router.js
-// Central conversation router: Phase 1 (qualifiers, conversational) → Phase 2 (offers) → Phase 3 (cash/financing)
+// Phase 1 (conversational qualifiers) → Phase 2 (offers) → Phase 3 (cash/financing)
 
 import * as Qualifier from './qualifier.js';
 import * as Offers from './offers.js';
 import * as CashFlow from './cash.js';
 import * as FinancingFlow from './financing.js';
+import { getUserProfile } from '../lib/messenger.js';
 
 const MEMORY_TTL_DAYS = Number(process.env.MEMORY_TTL_DAYS || 7);
 
@@ -19,36 +20,44 @@ const HONORIFICS = ['sir', 'ma’am', 'boss'];
 const ACKS = ['Got it', 'Copy', 'Sige', 'Noted', 'Game', 'Solid'];
 
 function pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
-function maybeHonor() { return Math.random() < 0.35 ? ` ${pick(HONORIFICS)}` : ''; }
+function maybeHonor(session) {
+  // If we know the user's name, DON'T use honorifics
+  const hasName = !!(session?.user?.firstName);
+  if (hasName) return '';
+  return Math.random() < 0.35 ? ` ${pick(HONORIFICS)}` : '';
+}
 function ack() { return pick(ACKS); }
+function firstName(session) { return session?.user?.firstName || ''; }
 
-function askLine(kind) {
-  const h = maybeHonor();
+function askLine(kind, session) {
+  const h = maybeHonor(session);
+  const name = firstName(session);
+  const namePrefix = name ? `${name}, ` : ''; // e.g., "Kamille, "
   const bank = {
     payment: [
-      `Pwede tayo sa used cars either cash or hulugan${h}. Ano mas prefer mo?`,
-      `Cash or hulugan${h} tayo? Pareho ok—alin ang gusto mo?`,
-      `Pwede cash or financing${h}. Ano ang mas swak sa'yo?`,
+      `${namePrefix}pwede tayo sa used cars either cash or hulugan${h}. Ano mas prefer mo?`,
+      `${namePrefix}cash or hulugan${h} tayo? Pareho ok—alin ang gusto mo?`,
+      `${namePrefix}pwede cash or financing${h}. Ano ang mas swak sa'yo?`,
     ],
     budget: [
-      `${ack()}—magkano target budget mo${h}? (puwede ₱550k, 1.2m, etc.)`,
-      `Para di ako lumampas, ano budget mo${h}?`,
-      `Sige${h}, budget range mo ilan?`,
+      `${namePrefix}${ack()}—magkano target budget mo${h}? (puwede ₱550k, 1.2m, etc.)`,
+      `${namePrefix}para di ako lumampas, ano budget mo${h}?`,
+      `${namePrefix}sige${h}, budget range mo ilan?`,
     ],
     location: [
-      `Nationwide inventory tayo. Saan location mo${h} para ma-match ko sa pinakamalapit na showroom?`,
-      `Nationwide kami—anong city/province mo${h} para malapit ang options?`,
-      `Saan ka based${h}? (city/province lang) Iha-hanap ko yung pinakamalapit na units.`,
+      `${namePrefix}nationwide inventory tayo. Saan location mo${h} para ma-match ko sa pinakamalapit na showroom?`,
+      `${namePrefix}nationwide kami—anong city/province mo${h} para malapit ang options?`,
+      `${namePrefix}saan ka based${h}? (city/province lang) Iha-hanap ko yung pinakamalapit na units.`,
     ],
     transmission: [
-      `Marunong ka ba mag-manual${h} or automatic lang—or kahit ano ok?`,
-      `Transmission mo${h}—AT, MT, or ok lang kahit alin?`,
-      `Gusto mo automatic, manual, or any${h}?`,
+      `${namePrefix}marunong ka ba mag-manual${h} or automatic lang—or kahit ano ok?`,
+      `${namePrefix}transmission mo${h}—AT, MT, or ok lang kahit alin?`,
+      `${namePrefix}gusto mo automatic, manual, or any${h}?`,
     ],
     bodyType: [
-      `5-seater or 7+ seater ba hanap mo${h}? Or van/pickup ok din?`,
-      `Body type mo${h}—5-seater, 7-seater/MPV/SUV, or van/pickup?`,
-      `May prefer ka ba—sedan, SUV/MPV (7+), van, pickup—or ok lang any${h}?`,
+      `${namePrefix}5-seater or 7+ seater ba hanap mo${h}? Or van/pickup ok din?`,
+      `${namePrefix}body type mo${h}—5-seater, 7-seater/MPV/SUV, or van/pickup?`,
+      `${namePrefix}may prefer ka ba—sedan, SUV/MPV (7+), van, pickup—or ok lang any${h}?`,
     ],
   };
   return pick(bank[kind] || ['']);
@@ -57,7 +66,6 @@ function askLine(kind) {
 function needPhase1(qual) {
   return !(qual?.payment && qual?.budget && qual?.location && qual?.transmission && qual?.bodyType);
 }
-
 function nextMissingKey(qual) {
   if (!qual.payment) return 'payment';
   if (!qual.budget) return 'budget';
@@ -66,13 +74,12 @@ function nextMissingKey(qual) {
   if (!qual.bodyType) return 'bodyType';
   return null;
 }
-
 function askNextMissing(session) {
   const key = nextMissingKey(session.qualifier || {});
   if (!key) return null;
   if (!session._asked) session._asked = {};
-  let line = askLine(key);
-  if (session._asked[key] === line) line = askLine(key); // avoid immediate repeat
+  let line = askLine(key, session);
+  if (session._asked[key] === line) line = askLine(key, session); // avoid immediate repeat
   session._asked[key] = line;
   return line;
 }
@@ -80,10 +87,12 @@ function askNextMissing(session) {
 /* ========================= welcome / re-entry =========================== */
 function welcomeBlock(session) {
   const firstTime = !session.createdAtTs || isStale(session.createdAtTs);
+  const name = firstName(session);
+  const hi = name ? `Hi, ${name}!` : 'Hi!';
   if (firstTime) {
     return [{
       type: 'text',
-      text: "Hi! 👋 I’m your BentaCars consultant. Tutulungan kitang humanap ng swak na unit—di mo na kailangang mag-scroll nang mag-scroll. Let’s do this. 🙌",
+      text: `${hi} 👋 I’m your BentaCars consultant. Tutulungan kitang humanap ng swak na unit—di mo na kailangang mag-scroll nang mag-scroll. Let’s do this. 🙌`,
     }];
   }
   return [{
@@ -101,34 +110,42 @@ export async function route(session, userText, rawEvent) {
   const messages = [];
   const now = Date.now();
 
-  // bootstrap session
+  // bootstrap
   session.createdAtTs = session.createdAtTs || now;
   session.phase = session.phase || 'phase1';
   session.qualifier = session.qualifier || {};
   session.funnel = session.funnel || {};
   session._asked = session._asked || {};
 
+  // Try to fetch user name once per session (non-blocking)
+  try {
+    const psid = rawEvent?.sender?.id;
+    if (psid && !session.user?.firstName && !session._profileTried) {
+      session._profileTried = true;
+      const prof = await getUserProfile(psid);
+      if (prof?.first_name) {
+        session.user = { firstName: prof.first_name, lastName: prof.last_name || '', pic: prof.profile_pic || '' };
+      }
+    }
+  } catch (_) { /* ignore profile failures */ }
+
   const payload = (rawEvent?.postback?.payload && String(rawEvent.postback.payload)) || '';
 
   /* --------------------------- Quick controls --------------------------- */
   if (/^start over$/i.test(payload)) {
-    // hard reset but SKIP the welcome UI on purpose
+    // hard reset but SKIP welcome UI this turn
     session.phase = 'phase1';
     session.qualifier = {};
     session.funnel = {};
     session._asked = {};
     session._awaitingResume = false;
-
-    // Important: mark welcomed so we don't show the buttons again this turn
-    session._welcomed = true;
-
-    // Treat as a fresh conversation (prevents "returning" branch)
-    session.createdAtTs = Date.now();
+    session._welcomed = true;           // so we don't show welcome again right now
+    session.createdAtTs = Date.now();   // treat like fresh convo
   }
 
   /* --------------------------- Phase 1 --------------------------------- */
   if (session.phase === 'phase1') {
-    // Show welcome; for returning users, wait for choice (no qualifiers yet)
+    // Welcome; for returning users, wait for choice (no qualifiers yet)
     if (!session._welcomed) {
       const blocks = welcomeBlock(session);
       messages.push(...blocks);
@@ -152,7 +169,7 @@ export async function route(session, userText, rawEvent) {
       }
     }
 
-    // absorb Taglish inputs; extracts multiple values in one message
+    // absorb Taglish inputs
     if (userText) {
       session.qualifier = Qualifier.absorb(session.qualifier, userText);
     }
@@ -166,15 +183,16 @@ export async function route(session, userText, rawEvent) {
 
     // all qualifiers complete → natural preface before Phase 2
     const sum = Qualifier.summary(session.qualifier);
+    const name = firstName(session);
+    const lead = name ? `Alright ${name},` : 'Alright,';
     messages.push({
       type: 'text',
       text:
-        `Alright, ito’ng hahanapin ko for you:\n` +
+        `${lead} ito’ng hahanapin ko for you:\n` +
         `• ${sum.replace(/ • /g, '\n• ')}\n` +
         `Saglit, I’ll pull the best units that fit this. 🔎`,
     });
 
-    // hand over to Phase 2
     session.phase = 'phase2';
   }
 
@@ -184,13 +202,11 @@ export async function route(session, userText, rawEvent) {
     messages.push(...step.messages);
     session = step.session;
 
-    // move to Phase 3 when user chooses or decides payment path
     if (session.nextPhase === 'cash') {
       session.phase = 'cash';
     } else if (session.nextPhase === 'financing') {
       session.phase = 'financing';
     } else {
-      // still browsing offers
       return { session, messages };
     }
   }
@@ -220,7 +236,7 @@ export async function route(session, userText, rawEvent) {
   return { session, messages };
 }
 
-/* -------- Optional shim: compatibility if code expects handleMessage ----- */
+/* -------- Back-compat shim (optional) ---------------------------------- */
 export async function handleMessage({ psid, text, raw }) {
   if (!globalThis.__SESS) globalThis.__SESS = new Map();
   const sess = globalThis.__SESS.get(psid) ?? { psid };
