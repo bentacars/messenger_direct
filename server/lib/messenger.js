@@ -4,13 +4,72 @@ import { PAGE_ACCESS_TOKEN } from "./constants.js";
 
 const GRAPH = "https://graph.facebook.com/v17.0";
 
+// ✅ NEW sendMessage() — maps our internal message format to valid FB payload
 export async function sendMessage(psid, payload) {
-  const body = {
+  // Allow raw string
+  if (typeof payload === "string") {
+    return callSendAPI({
+      messaging_type: "RESPONSE",
+      recipient: { id: psid },
+      message: { text: payload }
+    });
+  }
+
+  // Text message
+  if (payload?.type === "text" || payload?.text) {
+    return callSendAPI({
+      messaging_type: "RESPONSE",
+      recipient: { id: psid },
+      message: { text: payload.text }
+    });
+  }
+
+  // Button template
+  if (payload?.type === "buttons" && payload.text && Array.isArray(payload.buttons)) {
+    const buttons = payload.buttons.map(b =>
+      b.type === "web_url"
+        ? { type: "web_url", title: b.title, url: b.url }
+        : { type: "postback", title: b.title, payload: b.payload || b.title }
+    );
+
+    return callSendAPI({
+      messaging_type: "RESPONSE",
+      recipient: { id: psid },
+      message: {
+        attachment: {
+          type: "template",
+          payload: {
+            template_type: "button",
+            text: payload.text,
+            buttons
+          }
+        }
+      }
+    });
+  }
+
+  // Image message
+  if (payload?.type === "image" && payload.url) {
+    return callSendAPI({
+      messaging_type: "RESPONSE",
+      recipient: { id: psid },
+      message: {
+        attachment: {
+          type: "image",
+          payload: { url: payload.url, is_reusable: true }
+        }
+      }
+    });
+  }
+
+  // Fallback
+  return callSendAPI({
+    messaging_type: "RESPONSE",
     recipient: { id: psid },
-    message: typeof payload === "string" ? { text: payload } : payload,
-  };
-  return callSendAPI(body);
+    message: { text: payload?.text || "✅" }
+  });
 }
+
 
 export async function sendTypingOn(psid) {
   return callSendAPI({ recipient: { id: psid }, sender_action: "typing_on" });
