@@ -1,6 +1,6 @@
 // server/lib/messenger.js
 import fetch from "node-fetch";
-import { FB_PAGE_TOKEN } from "./constants.js";
+import { PAGE_ACCESS_TOKEN } from "./constants.js";
 
 const GRAPH = "https://graph.facebook.com/v17.0";
 
@@ -30,7 +30,7 @@ export async function sendCarousel(psid, elements) {
 
 async function callSendAPI(body) {
   try {
-    const url = `${GRAPH}/me/messages?access_token=${FB_PAGE_TOKEN}`;
+    const url = `${GRAPH}/me/messages?access_token=${PAGE_ACCESS_TOKEN}`;
     const res = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
