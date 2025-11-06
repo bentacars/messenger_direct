@@ -7,7 +7,79 @@ import { route } from "../server/flows/router.js";
 import { handleInterrupts } from "../server/lib/interrupts.js";
 import { checkNudge, resetNudge } from "../server/lib/nudges.js";
 
+// --- Add this helper ---
+function toFbMessage(r) {
+  if (typeof r === "string") return r;
+
+  // text
+  if (r.type === "text") return { text: r.text || "" };
+
+  // buttons (FB button template)
+  if (r.type === "buttons") {
+    const buttons = (r.buttons || []).map(b => ({
+      type: b.type === "web_url" ? "web_url" : "postback",
+      title: b.title,
+      ...(b.type === "web_url" ? { url: b.url } : { payload: b.payload })
+    }));
+    return {
+      attachment: {
+        type: "template",
+        payload: { template_type: "button", text: r.text || "", buttons }
+      }
+    };
+  }
+
+  // carousel (generic template)
+  if (r.type === "carousel") {
+    return {
+      attachment: {
+        type: "template",
+        payload: { template_type: "generic", elements: r.elements || [] }
+      }
+    };
+  }
+
+  // default fallback
+  return { text: r.text || "" };
+}
+
 const VERIFY_TOKEN = process.env.FB_VERIFY_TOKEN || "";
+
+// Convert our internal reply objects into valid FB Send API payloads
+function toFbMessage(r) {
+  if (typeof r === "string") return { text: r };
+
+  // plain text
+  if (r.type === "text") return { text: r.text || "" };
+
+  // buttons → FB button template
+  if (r.type === "buttons") {
+    const buttons = (r.buttons || []).map(b => ({
+      type: b.type === "web_url" ? "web_url" : "postback",
+      title: b.title,
+      ...(b.type === "web_url" ? { url: b.url } : { payload: b.payload })
+    }));
+    return {
+      attachment: {
+        type: "template",
+        payload: { template_type: "button", text: r.text || "", buttons }
+      }
+    };
+  }
+
+  // carousel → FB generic template
+  if (r.type === "carousel") {
+    return {
+      attachment: {
+        type: "template",
+        payload: { template_type: "generic", elements: r.elements || [] }
+      }
+    };
+  }
+
+  // fallback
+  return { text: r.text || "" };
+}
 
 export default async function handler(req, res) {
   try {
@@ -73,13 +145,9 @@ export default async function handler(req, res) {
 
         // Send all replies (convert plain string to text message if needed)
         for (const r of replies) {
-          if (typeof r === "string") {
-            await sendMessage(psid, { text: r });
-          } else {
-            await sendMessage(psid, r);
-          }
-        }
-
+  await sendMessage(psid, toFbMessage(r));
+}
+    
         // Nudges (optional follow-up prompts if user stops replying)
         await checkNudge(newState, (t) => sendMessage(psid, t));
 
