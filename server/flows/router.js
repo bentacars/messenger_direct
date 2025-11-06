@@ -1,34 +1,34 @@
 // server/flows/router.js
-// LLM-first policy: model writes the reply; we keep light guardrails & matching trigger.
+// LLM-first policy: model writes the reply; we keep light guardrails & strict matching trigger.
 
-import { planWithLLM, mergeSlots, isGoodEnough, summarizeSlots } from "./qualifier.js";
 import { matchUnits, formatUnitReply } from "./offers.js";
 import { handleCashFlow } from "./cash.js";
 import { handleFinancingFlow } from "./financing.js";
 import { handleInterrupts } from "../lib/interrupts.js";
+import { planWithLLM, mergeSlots, summarizeSlots, hasAllCore } from "./qualifier.js";
 
-const REQUIRED = ["payment", "budget", "location", "transmission", "bodyType"];
-const OPTIONAL_PREFS = ["brand", "model", "variant", "year", "color", "coding"]; // captured and passed to matcher
+const CORE_FIELDS = ["payment", "budget", "location", "transmission", "bodyType"];
+const OPTIONAL_PREFS = ["brand", "model", "variant", "year", "color", "coding"];
 
 export async function router(ctx) {
   const { psid, text = "", attachments = [], state = {} } = ctx;
   const replies = [];
   const now = Date.now();
 
-  // hydrate session
+  // --- hydrate session ---
   const s = {
     phase: state.phase || "qualifying",
     slots: state.slots || {},
-    history: state.history || [],        // short rolling summary (optional)
+    history: state.history || [],       // optional running summary
     last_seen_at: state.last_seen_at || now,
     last_phase: state.last_phase || "qualifying",
-    last_ask: state.last_ask || null,    // { field, count }
+    last_ask: state.last_ask || null,   // { field, count }
     offeredUnits: state.offeredUnits || [],
     backupUnits: state.backupUnits || [],
     welcomed: state.welcomed || false,
   };
 
-  // 0) interrupts (FAQ/objection/small-talk)
+  // --- 0) interrupts (FAQ / objection / small-talk) ---
   const interrupt = await handleInterrupts(text, s);
   if (interrupt) {
     replies.push({ type: "text", text: interrupt.reply });
@@ -36,7 +36,7 @@ export async function router(ctx) {
     return { replies, newState: { ...s, last_seen_at: now } };
   }
 
-  // 1) re-entry handling (welcome once)
+  // --- 1) re-entry handling / welcome ---
   const returning = state.last_seen_at && (now - state.last_seen_at < 7 * 864e5);
   if (!s.welcomed) {
     s.welcomed = true;
@@ -57,7 +57,7 @@ export async function router(ctx) {
     });
   }
 
-  // handle start over
+  // Start over / continue
   if (/^start over$/i.test(text) || text === "START_OVER") {
     return {
       replies: [{ type: "text", text: "Sige, from the top tayo. Sagutin ko lang isa-isa para tumama agad. 😊" }],
@@ -68,71 +68,71 @@ export async function router(ctx) {
     replies.push({ type: "text", text: "Got it — tuloy tayo where we left off. 👍" });
   }
 
-  // 2) Let the model read the latest user message and update slots / decide next ask
-  //    planWithLLM should:
-  //    - extract newly mentioned fields (incl. optional prefs),
-  //    - decide next field to ask,
-  //    - write a short human/AAL reply (reply_text)
+  // --- 2) Let the model update slots + craft the single next ask (AAL) ---
   const plan = await planWithLLM({
-    text,
-    priorSlots: s.slots,
-    requiredKeys: REQUIRED,
-    optionalKeys: OPTIONAL_PREFS,
+    userText: text,
+    slots: s.slots,
+    lastAsk: s.last_ask,
+    history: s.history?.slice(-6).join(" • ") || "",
   });
 
-  // merge extracted slots (never lose what we already had)
-  if (plan?.slots) {
-    s.slots = mergeSlots(s.slots, plan.slots);
+  // merge newly extracted slots (don’t overwrite confirmed ones)
+  if (plan?.updated_slots) {
+    s.slots = mergeSlots(s.slots, plan.updated_slots);
   }
 
-  // Always send the LLM-crafted reply text first (human, AAL) when present
+  // Always send the LLM-crafted reply text first (human, AAL)
   if (plan?.reply_text) {
     replies.push({ type: "text", text: plan.reply_text });
   }
 
-  // 3) Gate: do NOT match until ALL required qualifiers are present
-  const missing = REQUIRED.filter((k) => !s.slots[k] || String(s.slots[k]).trim() === "");
-  if (missing.length > 0) {
-    // Ask only the next missing one (LLM already decided — plan.ask_next)
-    // If the model didn’t pick one (rare), just choose the first missing.
-    const nextField = plan?.ask_next || missing[0];
-    // Nudge the model to ask precisely for that one field next time
-    s.last_ask = { field: nextField, count: (s.last_ask?.field === nextField ? (s.last_ask.count || 0) + 1 : 1) };
-    // Stay in qualifying until all fields complete
+  // --- 3) STRICT gate: only match when ALL core fields are present (any order) ---
+  const wantMatch = hasAllCore(s.slots); // <- key guardrail
+
+  if (!wantMatch) {
+    // still qualifying: steer the model to the ONE missing field
+    const missing = CORE_FIELDS.filter(k => !s.slots[k] || String(s.slots[k]).trim() === "");
+    const nextField = plan?.ask_next || missing[0] || null;
+
+    if (nextField) {
+      s.last_ask = {
+        field: nextField,
+        count: s.last_ask?.field === nextField ? (s.last_ask.count || 0) + 1 : 1,
+      };
+    }
+
     s.phase = "qualifying";
     return { replies, newState: { ...s, last_seen_at: now } };
   }
 
-  // 4) All fields complete → move to matching
+  // --- 4) All fields complete → matching ---
   s.phase = "matching";
 
   const { mainUnits = [], backupUnits = [] } = await matchUnits(s.slots);
 
-  // If no units matched, keep it human: ask LLM to suggest a gentle adjustment (but remain in qualifying)
+  // No matches → ask LLM to craft a gentle adjustment (still human, no hardcoded loop)
   if (mainUnits.length === 0 && backupUnits.length === 0) {
-    // Let the model craft a polite, specific adjustment ask (no hardcoded text)
-    const retryPlan = await planWithLLM({
-      text: "", // let it use the current slots to compose a helpful nudge
-      priorSlots: s.slots,
-      requiredKeys: REQUIRED,
-      optionalKeys: OPTIONAL_PREFS,
-      intent: "no_results_adjustment",
+    const nudge = await planWithLLM({
+      userText: "Walang exact match — please craft a gentle adjustment ask based on current slots.",
+      slots: s.slots,
+      lastAsk: s.last_ask,
+      history: s.history?.slice(-6).join(" • ") || "",
     });
-    if (retryPlan?.reply_text) {
-      replies.push({ type: "text", text: retryPlan.reply_text });
+    if (nudge?.reply_text) {
+      replies.push({ type: "text", text: nudge.reply_text });
     } else {
-      // ultra-safe fallback (rarely used)
       replies.push({
         type: "text",
         text: "Medyo wala pang exact match. Pwede ba nating i-adjust ng kaunti ang budget, body type, o brand para may ma-suggest ako?",
       });
     }
     s.phase = "qualifying";
-    s.last_ask = { field: retryPlan?.ask_next || "budget", count: 1 };
+    // hint model where to go next (budget is often the flexible lever)
+    s.last_ask = { field: nudge?.ask_next || "budget", count: 1 };
     return { replies, newState: { ...s, last_seen_at: now } };
   }
 
-  // 5) Have matches — show up to 2 first, then ask which to view
+  // --- 5) Show up to 2 units, then ask which to view ---
   s.offeredUnits = mainUnits;
   s.backupUnits = backupUnits;
 
@@ -153,9 +153,9 @@ export async function router(ctx) {
     buttons: btns,
   });
 
-  // 6) Specialized flows (kept for Phase 3 after unit pick)
-  if (s.phase === "cash")   return await handleCashFlow({ ctx, replies, newState: s, text });
-  if (s.phase === "financing") return await handleFinancingFlow({ ctx, replies, newState: s, text });
+  // --- 6) Specialized flows (kept for Phase 3 after unit pick) ---
+  if (s.phase === "cash")        return await handleCashFlow({ ctx, replies, newState: s, text });
+  if (s.phase === "financing")   return await handleFinancingFlow({ ctx, replies, newState: s, text });
 
   return { replies, newState: { ...s, last_seen_at: now } };
 }
