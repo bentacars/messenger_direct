@@ -4,6 +4,38 @@
 
 import { askLLM } from "../lib/ai.js";
 
+// --- normalize tricky budget phrasings into a single number (upper bound) ---
+function normalizeBudget(raw = "") {
+  if (!raw) return "";
+  let s = String(raw).trim().toLowerCase();
+
+  // replace commas/spaces
+  s = s.replace(/[, ]+/g, "");
+
+  // k/m suffixes
+  s = s.replace(/(\d+(?:\.\d+)?)m\b/g, (_, n) => String(Math.round(parseFloat(n) * 1_000_000)));
+  s = s.replace(/(\d+(?:\.\d+)?)k\b/g, (_, n) => String(Math.round(parseFloat(n) * 1_000)));
+
+  // ranges: 500-600k, 500~600k, 500to600k
+  const r1 = s.match(/(\d{2,})(?:-|~|to)(\d{2,})/);
+  if (r1) {
+    const a = parseInt(r1[1], 10);
+    const b = parseInt(r1[2], 10);
+    const hi = Math.max(a, b);
+    return String(hi);
+  }
+
+  // below/under/<= cases
+  const r2 = s.match(/(?:below|under|<=?|upto|up\s*to)(\d{2,})/);
+  if (r2) return String(parseInt(r2[1], 10));
+
+  // plain number somewhere
+  const r3 = s.match(/(\d{3,})/);
+  if (r3) return String(parseInt(r3[1], 10));
+
+  return "";
+}
+
 /** The slots we care about (not a rigid order). */
 export const SLOT_KEYS = [
   "payment",       // "cash" | "financing"
@@ -28,9 +60,9 @@ export function mergeSlots(prev = {}, patch = {}) {
     if (v === undefined || v === null || String(v).trim() === "") continue;
     if (!out[k] || String(out[k]).trim() === "") out[k] = v;
   }
-  // sanitize budget
-  if (out.budget) out.budget = String(out.budget).replace(/[^\d]/g, "");
-  return out;
+ // sanitize budget
+if (out.budget) {
+  out.budget = normalizeBudget(out.budget);
 }
 
 /** Quick human summary for continuity lines. */
