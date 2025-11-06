@@ -1,128 +1,133 @@
 // server/flows/router.js
-// LLM-first orchestrator: Phase 1 (qualify) → Phase 2 (offers) → Phase 3 (cash/financing flows)
+// LLM-first policy: model writes the reply, we keep light guardrails & matching trigger.
 
-import { askLLM } from "../lib/ai.js";
-import { extractQualifiers, missingFields, askForMissingConversational } from "./qualifier.js";
+import { planWithLLM, mergeSlots, isGoodEnough, summarizeSlots } from "./qualifier.js";
 import { matchUnits, formatUnitReply } from "./offers.js";
 import { handleCashFlow } from "./cash.js";
 import { handleFinancingFlow } from "./financing.js";
 import { handleInterrupts } from "../lib/interrupts.js";
-import { formatSummary } from "../lib/model.js";
 
 export async function router(ctx) {
-  const { text = "", state = {} } = ctx;
-
+  const { psid, text = "", state = {} } = ctx;
   const replies = [];
-  const newState = { ...state };
+  const now = Date.now();
 
-  // Init
-  if (!newState.phase) {
-    newState.phase = "phase1";
-    newState.created_at = Date.now();
+  // hydrate session
+  const s = {
+    phase: state.phase || "qualifying",
+    slots: state.slots || {},
+    history: state.history || "",       // short rolling summary (optional)
+    last_seen_at: state.last_seen_at || now,
+    last_phase: state.last_phase || "qualifying",
+    last_ask: state.last_ask || null,   // { field, count }
+    _offeredUnits: state._offeredUnits || [],
+    _backupUnits: state._backupUnits || [],
+    _welcomed: state._welcomed || false,
+  };
+
+  // 0) interrupts (FAQ/objection/small-talk)
+  const interrupt = await handleInterrupts(text, s);
+  if (interrupt) {
+    replies.push({ type: "text", text: interrupt.reply });
+    if (interrupt.resume) replies.push({ type: "text", text: interrupt.resume });
+    return { replies, newState: { ...s, last_seen_at: now } };
   }
 
-  // ---- INTERRUPTS: run only when Phase 1 is COMPLETE ----
-  if (newState.phase !== "phase1" || missingFields(newState.qualifier || {}).length === 0) {
-    const interrupt = await handleInterrupts(text, newState);
-    if (interrupt) {
-      replies.push({ type: "text", text: interrupt.reply });
-      if (interrupt.resume) replies.push({ type: "text", text: interrupt.resume });
-      return { replies, newState };
+  // 1) re-entry handling
+  const returning = state.last_seen_at && (now - state.last_seen_at < 7 * 864e5);
+  if (!s._welcomed) {
+    if (returning && Object.keys(s.slots).length) {
+      replies.push({
+        type: "buttons",
+        text: `Welcome back! 😊 Continue (“${summarizeSlots(s.slots)}”) or start over?`,
+        buttons: [
+          { type: "postback", title: "Continue", payload: "CONTINUE_FLOW" },
+          { type: "postback", title: "Start over", payload: "START_OVER" },
+        ],
+      });
+      s._welcomed = true;
+      return { replies, newState: { ...s, last_seen_at: now } };
     }
+    replies.push({ type: "text", text: "Hello! I’ll help you find the best unit, mabilis at human—not checklist. 🚗" });
+    s._welcomed = true;
   }
 
-  // Route by phase
-  switch (newState.phase) {
-    case "phase1":
-      return await phase1({ ctx, text, replies, newState });
-    case "phase2":
-      return await phase2({ ctx, text, replies, newState });
-    case "cash":
-      return await handleCashFlow({ ctx, replies, newState, text });
-    case "financing":
-      return await handleFinancingFlow({ ctx, replies, newState, text });
-    default:
-      replies.push({ type: "text", text: "Oops, naputol yata. Start ulit tayo?" });
-      return { replies, newState: { phase: "phase1", qualifier: {} } };
+  // explicit resets
+  if (/START_OVER/.test(text) || /^start( over)?$/i.test(text) || /reset/i.test(text)) {
+    const fresh = { phase: "qualifying", slots: {}, history: "", _welcomed: true, last_seen_at: now };
+    replies.push({ type: "text", text: "Fresh start tayo. 👍" });
+    return { replies, newState: fresh };
   }
-}
-
-/* ------------------------- PHASE 1: QUALIFY ------------------------- */
-async function phase1({ text, replies, newState }) {
-  // First message?
-  if (!newState._welcomed) {
-    newState._welcomed = true;
-    replies.push({
-      type: "text",
-      text:
-        "Hi! 👋 Ako ang AI consultant ng BentaCars. Tutulungan kitang maghanap ng swak na unit — mabilis at klaro lang tayo. 🚗",
-    });
+  if (/CONTINUE_FLOW/.test(text)) {
+    replies.push({ type: "text", text: "Sige, itutuloy ko kung saan tayo huli. Saglit lang…" });
   }
 
-  // Run LLM extractor on every user turn; merge into stored qualifiers
-  const prev = newState.qualifier || {};
-  const merged = await extractQualifiers(text, prev);
-  newState.qualifier = merged;
-
-  // Ask next missing (LLM conversational)
-  const missing = missingFields(merged);
-  if (missing.length > 0) {
-    const ask = await askForMissingConversational(missing, text);
-    replies.push({ type: "text", text: ask });
-    return { replies, newState };
-  }
-
-  // Complete -> summarize and move to Phase 2
-  const sum = formatSummary(merged);
-  replies.push({
-    type: "text",
-    text: `Nice, kompleto na ✅ I’ll match units based on: ${sum}. Saglit, i-check ko inventory…`,
+  // 2) Let the LLM decide the move for this turn (it writes the reply)
+  const plan = await planWithLLM({
+    userText: text,
+    slots: s.slots,
+    lastAsk: s.last_ask,
+    history: s.history,
   });
 
-  newState.phase = "phase2";
-  return { replies, newState };
-}
+  // Merge any extracted slots
+  s.slots = mergeSlots(s.slots, plan.updated_slots);
+  s.last_seen_at = now;
 
-/* ------------------------- PHASE 2: MATCH/OFFERS -------------------- */
-async function phase2({ replies, newState, text }) {
-  const { qualifier } = newState;
-
-  // “Others / more” paging
-  if (/others|iba pa|more/i.test(text)) {
-    const backup = newState._backupUnits || [];
-    if (!backup.length) {
-      replies.push({ type: "text", text: "Wala nang exact match. Gusto mo mag-try ng alternatives (ibang brand/body type/budget)?" });
-      return { replies, newState };
+  // Anti-loop: if model keeps asking the same field, increment count; if >1 we’ll bias to proceed/check matches next turn
+  if (plan.ask_next) {
+    if (s.last_ask?.field === plan.ask_next) {
+      s.last_ask = { field: plan.ask_next, count: (s.last_ask.count || 0) + 1 };
+    } else {
+      s.last_ask = { field: plan.ask_next, count: 1 };
     }
-    for (const u of backup) replies.push(await formatUnitReply(u, qualifier.payment));
-    replies.push({ type: "text", text: "Alin dito gusto mong i-view? 😊" });
-    return { replies, newState };
   }
 
-  // Fetch matches
-  const { mainUnits, backupUnits } = await matchUnits(qualifier);
+  // 3) Decide if we should match now: model suggestion OR our guard says it's good enough
+  const wantMatch = Boolean(plan.proceed_to_matching) || isGoodEnough(s.slots) || (s.last_ask?.count >= 2);
 
-  if (!mainUnits.length && !backupUnits.length) {
+  // Always send the LLM-crafted reply text first (human, AAL)
+  if (plan.reply_text) replies.push({ type: "text", text: plan.reply_text });
+
+  if (s.phase === "qualifying" && wantMatch) {
+    s.phase = "matching";
+  }
+
+  // 4) Matching flow
+  if (s.phase === "matching") {
+    const { mainUnits, backupUnits } = await matchUnits(s.slots);
+
+    if ((mainUnits?.length || 0) === 0 && (backupUnits?.length || 0) === 0) {
+      // graceful fallback—ask for two most useful hints
+      replies.push({ type: "text", text: "Para tumama pa lalo, share mo lang budget range at location—mabilis ko i-aadjust." });
+      s.phase = "qualifying";
+      s.last_ask = { field: "budget", count: 1 };
+      return { replies, newState: s };
+    }
+
+    s._offeredUnits = mainUnits;
+    s._backupUnits  = backupUnits;
+
+    for (const u of (mainUnits || []).slice(0, 2)) {
+      replies.push(await formatUnitReply(u, s.slots.payment));
+    }
     replies.push({
-      type: "text",
-      text: "Medyo wala tayong exact match sa hanap mo. Pwede nating i-adjust (budget/brand/body type) — okay ba?",
+      type: "buttons",
+      text: "Gusto mong i-view alin dito? Pwede ring ‘Others’ para dagdagan ko pa.",
+      buttons: [
+        ...(mainUnits || []).slice(0, 2).map((u, i) => ({ type: "postback", title: `Unit ${i + 1}`, payload: `UNIT_PICK_${u.SKU}` })),
+        { type: "postback", title: "Others", payload: "SHOW_OTHERS" },
+      ],
     });
-    return { replies, newState };
+    return { replies, newState: s };
   }
 
-  for (const u of mainUnits) replies.push(await formatUnitReply(u, qualifier.payment));
+  // 5) Cash / Financing specialized flows (kept for Phase 3 after unit pick)
+  if (s.phase === "cash")       return await handleCashFlow({ ctx, replies, newState: s, text });
+  if (s.phase === "financing")  return await handleFinancingFlow({ ctx, replies, newState: s, text });
 
-  newState._offeredUnits = mainUnits;
-  newState._backupUnits = backupUnits;
-
-  const buttons = [
-    ...mainUnits.map((u, i) => ({ type: "postback", title: `Unit ${i + 1}`, payload: `UNIT_PICK_${u.SKU}` })),
-    { type: "postback", title: "Others", payload: "SHOW_OTHERS" },
-  ];
-
-  replies.push({ type: "buttons", text: "Gusto mo i-view yung alin dito?", buttons });
-
-  return { replies, newState };
+  // Default: keep conversing in qualifying with the LLM-crafted reply
+  return { replies, newState: s };
 }
 
 export { router as route };
