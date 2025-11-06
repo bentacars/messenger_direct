@@ -59,3 +59,34 @@ export async function jsonExtract({ system, input, schemaName }) {
     return {};
   }
 }
+
+// ---- TEMP BACKWARD-COMPAT SHIM FOR askLLM() ----
+// Some older flow files still import askLLM().
+// This wrapper makes them work without modifying every file.
+
+export async function askLLM(prompt, opts = {}) {
+  const { json = false, temperature = 0.7 } = opts;
+
+  if (!json) {
+    const res = await complete([
+      { role: "system", content: "You are a helpful assistant." },
+      { role: "user", content: prompt }
+    ], temperature);
+    return res;
+  }
+
+  // JSON mode → force schema extract
+  try {
+    return await jsonExtract(
+      "extract",
+      prompt,
+      {
+        type: "object",
+        additionalProperties: true
+      }
+    );
+  } catch (err) {
+    console.error("[askLLM JSON error]", err);
+    throw err;
+  }
+}
