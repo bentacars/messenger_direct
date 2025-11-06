@@ -46,27 +46,29 @@ export async function jsonExtract({
   input = "",
   schemaName = "extract",
   // Allow override, but provide safe defaults that match the rest of the app.
-  properties = {
-    payment: { type: "string", description: "cash or financing if stated" },
-    budget: { type: "string", description: "digits only, no commas" },
-    location: { type: "string", description: "city/province if stated" },
-    transmission: { type: "string", description: "automatic|manual|any if stated" },
-    bodyType: { type: "string", description: "sedan|suv|mpv|van|pickup|hatchback|crossover|auv etc." },
-    brand: { type: "string" },
-    model: { type: "string" },
-    variant: { type: "string" },
-    year: { type: "string" },
+ const properties = {
+  payment:      { type: ["string","null"], description: "cash or financing if stated" },
+  budget:       { type: ["string","null"], description: "digits only, no commas" },
+  location:     { type: ["string","null"], description: "city/province if stated" },
+  transmission: { type: ["string","null"], description: "automatic | manual | any" },
+  bodyType:     { type: ["string","null"], description: "sedan|suv|mpv|van|pickup|hatchback|crossover|auv" },
+  brand:        { type: ["string","null"] },
+  model:        { type: ["string","null"] },
+  variant:      { type: ["string","null"] },
+  year:         { type: ["string","null"] }
+};
+
+ const schema = {
+  name: schemaName,
+  strict: true,
+  schema: {
+    type: "object",
+    properties,
+    required: Object.keys(properties),   // API requires listing every key
+    additionalProperties: false          // also required when strict
   },
-}) {
-  const schema = {
-    name: schemaName,
-    strict: true,
-    schema: {
-      type: "object",
-      additionalProperties: false, // <-- REQUIRED by the API
-      properties,
-    },
-  };
+};
+
 
   const rsp = await client.chat.completions.create({
     model: MODELS.extractor,
