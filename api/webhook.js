@@ -7,9 +7,8 @@ import { route } from "../server/flows/router.js";
 import { handleInterrupts } from "../server/lib/interrupts.js";
 import { checkNudge, resetNudge } from "../server/lib/nudges.js";
 
-// --- Add this helper ---
-function toFbMessage(r) {
-  if (typeof r === "string") return r;
+  // keep ONE of these; remove any duplicate
+const toFbMessage = (r) => (typeof r === "string" ? { text: r } : r);
 
   // text
   if (r.type === "text") return { text: r.text || "" };
@@ -44,10 +43,6 @@ function toFbMessage(r) {
 }
 
 const VERIFY_TOKEN = process.env.FB_VERIFY_TOKEN || "";
-
-// Convert our internal reply objects into valid FB Send API payloads
-function toFbMessage(r) {
-  if (typeof r === "string") return { text: r };
 
   // plain text
   if (r.type === "text") return { text: r.text || "" };
