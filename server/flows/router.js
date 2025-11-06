@@ -176,3 +176,5 @@ async function handlePhase2({ ctx, replies, newState, text }) {
 
   return { replies, newState };
 }
+
+export { router as route };
