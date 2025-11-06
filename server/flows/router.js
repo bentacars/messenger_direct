@@ -86,24 +86,25 @@ export async function router(ctx) {
     replies.push({ type: "text", text: plan.reply_text });
   }
 
-  // --- 3) STRICT gate: only match when ALL core fields are present (any order) ---
-  const wantMatch = hasAllCore(s.slots); // <- key guardrail
+ // --- 3) STRICT gate: only match when ALL core fields are present (any order) ---
+const wantMatch = hasAllCore(s.slots);   // <-- NEW guard
 
-  if (!wantMatch) {
-    // still qualifying: steer the model to the ONE missing field
-    const missing = CORE_FIELDS.filter(k => !s.slots[k] || String(s.slots[k]).trim() === "");
-    const nextField = plan?.ask_next || missing[0] || null;
+if (!wantMatch) {
+  // still qualifying — steer the model to the ONE missing field
+  const missing = CORE_FIELDS.filter(k => !s.slots[k] || String(s.slots[k]).trim() === "");
+  const nextField = plan?.ask_next || missing[0] || null;
 
-    if (nextField) {
-      s.last_ask = {
-        field: nextField,
-        count: s.last_ask?.field === nextField ? (s.last_ask.count || 0) + 1 : 1,
-      };
-    }
-
-    s.phase = "qualifying";
-    return { replies, newState: { ...s, last_seen_at: now } };
+  if (nextField) {
+    s.last_ask = {
+      field: nextField,
+      count: s.last_ask?.field === nextField ? (s.last_ask.count || 0) + 1 : 1,
+    };
   }
+
+  s.phase = "qualifying";
+  return { replies, newState: { ...s, last_seen_at: now } };
+}
+
 
   // --- 4) All fields complete → matching ---
   s.phase = "matching";
