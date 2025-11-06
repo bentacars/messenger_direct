@@ -11,6 +11,7 @@ const VERIFY_TOKEN = process.env.FB_VERIFY_TOKEN || "";
 
 export default async function handler(req, res) {
   try {
+    // ---- VERIFY WEBHOOK ----
     if (req.method === "GET") {
       const mode = req.query["hub.mode"];
       const token = req.query["hub.verify_token"];
@@ -21,8 +22,9 @@ export default async function handler(req, res) {
       return res.status(403).send("Forbidden");
     }
 
+    // ---- MUST BE POST FOR NORMAL FLOW ----
     if (req.method !== "POST") {
-      return res.status(405).json({ ok: false });
+      return res.status(405).json({ ok: false, error: "Method not allowed" });
     }
 
     const body = req.body || {};
@@ -33,13 +35,23 @@ export default async function handler(req, res) {
         const psid = evt.sender?.id;
         if (!psid) continue;
 
-        const text = evt.message?.text || evt.postback?.payload || "";
+        // Normalized text from user (message, postback title, fallback payload)
+        const text =
+          evt.message?.text ||
+          evt.postback?.title ||
+          evt.postback?.payload ||
+          "";
+
+        // Collect attachments (e.g. images, files)
+        const attachments = evt.message?.attachments || [];
+
+        // Load session
         let session = await getSession(psid);
 
         await sendTypingOn(psid);
-        resetNudge(session);
+        await resetNudge(session);
 
-        // Interrupts (FAQ/objections)
+        // ---- INTERRUPTS (FAQ, off-topic, objections) ----
         if (text) {
           const intr = await handleInterrupts(text, session);
           if (intr) {
@@ -47,16 +59,33 @@ export default async function handler(req, res) {
             if (intr.resume) await sendMessage(psid, intr.resume);
             await setSession(psid, session);
             await sendTypingOff(psid);
-            continue;
+            continue; // Stop here — do not move to normal flow
           }
         }
 
-        // Main LLM flow
-        const { messages, nextSession } = await route({ session, text, evt });
-        for (const msg of messages) await sendMessage(psid, msg);
+        // ---- MAIN ROUTER (LLM flow) ----
+        const { replies = [], newState } = await route({
+          psid,
+          text,
+          attachments,
+          state: session,
+        });
 
-        await checkNudge(nextSession, (t) => sendMessage(psid, t));
-        await setSession(psid, nextSession);
+        // Send all replies (convert plain string to text message if needed)
+        for (const r of replies) {
+          if (typeof r === "string") {
+            await sendMessage(psid, { text: r });
+          } else {
+            await sendMessage(psid, r);
+          }
+        }
+
+        // Nudges (optional follow-up prompts if user stops replying)
+        await checkNudge(newState, (t) => sendMessage(psid, t));
+
+        // Save session
+        await setSession(psid, newState);
+
         await sendTypingOff(psid);
       }
     }
