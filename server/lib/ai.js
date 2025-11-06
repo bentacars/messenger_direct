@@ -36,18 +36,15 @@ export async function complete({
   return rsp.choices?.[0]?.message?.content?.trim() || "";
 }
 
-/**
- * JSON extractor using OpenAI json_schema format (strict).
- * IMPORTANT: Root must include additionalProperties: false.
- * Also align keys to your qualifier pipeline (bodyType, not 'body').
- */
+// server/lib/ai.js  — replace ONLY this function
 export async function jsonExtract({ system, input, schemaName }) {
-  const properties = {
-    payment:      { type: "string", description: "cash or financing if stated" },
-    budget:       { type: "string", description: "digits only, no commas" },
-    location:     { type: "string", description: "city/province if stated" },
-    transmission: { type: "string", description: "automatic|manual|any if stated" },
-    bodyType:     { type: "string", description: "sedan|suv|mpv|van|pickup|hatchback|crossover|auv etc." },
+  // define the properties once (keep key names aligned with qualifier.js)
+  const props = {
+    payment:      { type: "string",  description: "cash or financing if stated" },
+    budget:       { type: "number",  description: "digits only, no commas" },
+    location:     { type: "string",  description: "city/province if stated" },
+    transmission: { type: "string",  description: "automatic|manual|any if stated" },
+    bodyType:     { type: "string",  description: "sedan|suv|mpv|van|pickup|crossover|hatchback|auv etc." },
     brand:        { type: "string" },
     model:        { type: "string" },
     variant:      { type: "string" },
@@ -59,16 +56,16 @@ export async function jsonExtract({ system, input, schemaName }) {
     strict: true,
     schema: {
       type: "object",
-      additionalProperties: false,
-      properties,
-      required: Object.keys(properties) // OpenAI requires this when strict
+      properties: props,
+      required: Object.keys(props),        // <-- important
+      additionalProperties: false          // <-- important
     }
   };
 
   const rsp = await client.chat.completions.create({
     model: MODELS.extractor,
     messages: [
-      { role: "system", content: system },
+      { role: "system", content: system || "Extract only what is explicitly stated. Do not guess." },
       { role: "user", content: input }
     ],
     temperature: 0.1,
@@ -77,24 +74,6 @@ export async function jsonExtract({ system, input, schemaName }) {
 
   try {
     return JSON.parse(rsp.choices?.[0]?.message?.content || "{}");
-  } catch {
-    return {};
-  }
-}
-
-  const rsp = await client.chat.completions.create({
-    model: MODELS.extractor,
-    messages: [
-      { role: "system", content: system },
-      { role: "user", content: input },
-    ],
-    temperature: 0.1,
-    response_format: { type: "json_schema", json_schema: schema },
-  });
-
-  try {
-    const txt = rsp.choices?.[0]?.message?.content || "{}";
-    return JSON.parse(txt);
   } catch {
     return {};
   }
