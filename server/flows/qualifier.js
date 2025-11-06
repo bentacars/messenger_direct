@@ -14,6 +14,12 @@ export const SLOT_KEYS = [
   "brand", "model", "variant", "year" // optional prefs
 ];
 
+export const REQUIRED_CORE = ["payment","budget","bodyType","transmission","location"];
+
+export function hasAllCore(slots = {}) {
+  return REQUIRED_CORE.every(k => slots[k] && String(slots[k]).trim() !== "");
+}
+
 /** Merge, without overwriting already-confirmed info unless new value is non-empty. */
 export function mergeSlots(prev = {}, patch = {}) {
   const out = { ...prev };
