@@ -1,34 +1,45 @@
 // /api/debug-imports.js
 export const config = { runtime: "nodejs" };
 
-import * as ai from "../server/lib/ai.js";
-import * as interrupts from "../server/lib/interrupts.js";
-import * as messenger from "../server/lib/messenger.js";
-import * as qualifier from "../server/flows/qualifier.js";
-import * as router from "../server/flows/router.js";
-import * as cash from "../server/flows/cash.js";
-import * as financing from "../server/flows/financing.js";
-import * as nudges from "../server/lib/nudges.js";
+/** Safely import a module using a file:// URL and report its exported keys. */
+async function probe(relPath) {
+  try {
+    const url = new URL(relPath, import.meta.url);        // resolve to absolute file URL
+    const mod = await import(url.href);                   // dynamic import, but explicit path
+    return { module: relPath, ok: true, keys: Object.keys(mod) };
+  } catch (e) {
+    return { module: relPath, ok: false, error: String(e?.message || e) };
+  }
+}
 
 export default async function handler(_req, res) {
-  const shape = (m) => (m ? Object.keys(m) : []);
-  const results = [
-    { module: "../server/lib/ai.js",          ok: true, keys: shape(ai) },
-    { module: "../server/lib/interrupts.js",  ok: true, keys: shape(interrupts) },
-    { module: "../server/lib/messenger.js",   ok: true, keys: shape(messenger) },
-    { module: "../server/flows/qualifier.js", ok: true, keys: shape(qualifier) },
-    { module: "../server/flows/router.js",    ok: true, keys: shape(router) },
-    { module: "../server/flows/cash.js",      ok: true, keys: shape(cash) },
-    { module: "../server/flows/financing.js", ok: true, keys: shape(financing) },
-    { module: "../server/lib/nudges.js",      ok: true, keys: shape(nudges) },
+  const targets = [
+    "../server/lib/ai.js",
+    "../server/lib/interrupts.js",
+    "../server/lib/messenger.js",
+    "../server/flows/qualifier.js",
+    "../server/flows/router.js",
+    "../server/flows/cash.js",
+    "../server/flows/financing.js",
+    "../server/lib/nudges.js",
   ];
 
-  // Extra hints about router interop
-  results.push({
-    module: "router export hints",
-    ok: true,
-    note: `router: ${typeof router.router}, default: ${typeof router.default}, keys: ${shape(router).join(",")}`,
-  });
+  const results = [];
+  for (const p of targets) results.push(await probe(p));
 
-  return res.status(200).json({ results, failed: 0 });
+  // small hint about router shape (helps webhook import interop)
+  try {
+    const url = new URL("../server/flows/router.js", import.meta.url);
+    const r = await import(url.href);
+    results.push({
+      module: "router exports",
+      ok: true,
+      note: `router:${typeof r.router}, default:${typeof r.default}, keys:${Object.keys(r).join(",")}`,
+    });
+  } catch (e) {
+    results.push({ module: "router exports", ok: false, error: String(e?.message || e) });
+  }
+
+  const failed = results.filter(r => !r.ok).length;
+  res.status(200).json({ results, failed });
 }
