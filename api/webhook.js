@@ -114,6 +114,25 @@ export default async function handler(req, res) {
           evt.postback?.payload ||
           "";
 
+        // inside the for (const evt of entry.messaging || []) loop, right after you compute psid:
+
+// Ignore delivery/read/standby events & echoes
+if (evt.message?.is_echo) continue;
+if (evt.delivery || evt.read || evt.standby) continue;
+
+// De-dup by message id (Meta can retry)
+const mid = evt.message?.mid || evt.postback?.mid || null;
+let session = await getSession(psid);
+session.processed_mids = Array.isArray(session.processed_mids) ? session.processed_mids : [];
+if (mid && session.processed_mids.includes(mid)) {
+  continue; // already handled
+}
+// keep a small rolling window of last 20 mids
+if (mid) {
+  session.processed_mids.push(mid);
+  if (session.processed_mids.length > 20) session.processed_mids.shift();
+}
+        
         const attachments = evt.message?.attachments || [];
         let session = await getSession(psid);
 
