@@ -1,5 +1,5 @@
 // api/webhook.js
-export const config = { runtime: "nodejs20.x" };
+export const config = { runtime: "nodejs" };
 
 import { getSession, setSession } from "../server/lib/session.js";
 import { sendTypingOn, sendTypingOff, sendMessage } from "../server/lib/messenger.js";
