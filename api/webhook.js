@@ -13,30 +13,46 @@ const VERIFY_TOKEN = process.env.FB_VERIFY_TOKEN || "";
 const router =
   RouterNS.router ||
   (RouterNS.default && (RouterNS.default.router || RouterNS.default)) ||
-  RouterNS.route; // last resort if named 'route'
+  RouterNS.route;
 
 /**
- * Map our internal reply objects → Facebook Send API payload.
- * Supports: string, {type:"text"}, {type:"buttons"}, {type:"carousel"}, {type:"image"},
- * or already-FB-shaped objects containing {text} or {attachment}.
+ * Normalize our internal reply objects → valid Facebook Send API payload.
+ * Accepts:
+ *  - string
+ *  - {type:"text", text}
+ *  - {type:"buttons", text, buttons:[{title, payload}|{title, url|type:"web_url"}]}
+ *  - {type:"carousel", elements:[...]}
+ *  - {type:"image", url}
+ *  - OR already-FB-shaped: {text} or {attachment}
  */
 function toFbMessage(r) {
-  if (typeof r === "string") return { text: r };           // plain string
-  if (r && (r.text || r.attachment)) return r;             // already FB-shaped
+  // 1) Plain string
+  if (typeof r === "string") return { text: r };
 
-  if (r?.type === "text") return { text: r.text || "" };
+  // 2) Already FB-shaped (BUT only if there's NO internal "type")
+  if (r && !r.type && (r.text || r.attachment)) return r;
+
+  // 3) Our normalized shapes
+  if (r?.type === "text") {
+    return { text: r.text || "" };
+  }
 
   if (r?.type === "buttons") {
     const buttons = (r.buttons || []).map((b) => {
       if (b.type === "web_url" || b.type === "url") {
         return { type: "web_url", title: b.title, url: b.url };
       }
+      // default to postback
       return { type: "postback", title: b.title, payload: b.payload || b.title || "BTN_CLICK" };
     });
     return {
       attachment: {
         type: "template",
-        payload: { template_type: "button", text: r.text || "Please choose:", buttons },
+        payload: {
+          template_type: "button",
+          text: r.text || "Please choose:",
+          buttons,
+        },
       },
     };
   }
@@ -45,16 +61,25 @@ function toFbMessage(r) {
     return {
       attachment: {
         type: "template",
-        payload: { template_type: "generic", elements: r.elements || [] },
+        payload: {
+          template_type: "generic",
+          elements: r.elements || [],
+        },
       },
     };
   }
 
   if (r?.type === "image") {
-    return { attachment: { type: "image", payload: { url: r.url, is_reusable: true } } };
+    return {
+      attachment: {
+        type: "image",
+        payload: { url: r.url, is_reusable: true },
+      },
+    };
   }
 
-  return { text: r?.text || "✅" }; // safe fallback
+  // 4) Safe fallback
+  return { text: r?.text || "✅" };
 }
 
 export default async function handler(req, res) {
@@ -64,7 +89,9 @@ export default async function handler(req, res) {
       const mode = req.query["hub.mode"];
       const token = req.query["hub.verify_token"];
       const challenge = req.query["hub.challenge"];
-      if (mode === "subscribe" && token === VERIFY_TOKEN) return res.status(200).send(challenge);
+      if (mode === "subscribe" && token === VERIFY_TOKEN) {
+        return res.status(200).send(challenge);
+      }
       return res.status(403).send("Forbidden");
     }
 
@@ -91,9 +118,9 @@ export default async function handler(req, res) {
         let session = await getSession(psid);
 
         await sendTypingOn(psid);
-        await resetNudge(session); // await to keep state consistent
+        await resetNudge(session);
 
-        // ---- INTERRUPTS (FAQ, off-topic, objections) ----
+        // ---- INTERRUPTS (FAQ, objections, small talk) ----
         if (text) {
           const intr = await handleInterrupts(text, session);
           if (intr) {
@@ -119,11 +146,15 @@ export default async function handler(req, res) {
           state: session,
         });
 
+        // Send all replies via our formatter
         for (const r of replies) {
           await sendMessage(psid, toFbMessage(r));
         }
 
+        // Optional nudge scheduling
         await checkNudge(newState, (t) => sendMessage(psid, toFbMessage(t)));
+
+        // Persist session
         await setSession(psid, newState);
 
         await sendTypingOff(psid);
