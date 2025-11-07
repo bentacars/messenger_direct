@@ -1,7 +1,12 @@
 {
   "functions": {
     "api/*": {
-      "includeFiles": "server/**"
+      "runtime": "nodejs18.x",
+      "includeFiles": [
+        "server/**",
+        "node_modules/openai/**",
+        "node_modules/@upstash/redis/**"
+      ]
     }
   }
 }
