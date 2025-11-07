@@ -3,12 +3,17 @@ export const config = { runtime: "nodejs" };
 
 import { getSession, setSession } from "../server/lib/session.js";
 import { sendTypingOn, sendTypingOff, sendMessage } from "../server/lib/messenger.js";
-import * as Router from "../server/flows/router.js";
-const route = Router.route || Router.router || Router.default;
+import * as RouterNS from "../server/flows/router.js";
 import { handleInterrupts } from "../server/lib/interrupts.js";
 import { checkNudge, resetNudge } from "../server/lib/nudges.js";
 
 const VERIFY_TOKEN = process.env.FB_VERIFY_TOKEN || "";
+
+/** Resolve router function regardless of CJS/ESM shape */
+const router =
+  RouterNS.router ||
+  (RouterNS.default && (RouterNS.default.router || RouterNS.default)) ||
+  RouterNS.route; // last resort if named 'route'
 
 /**
  * Map our internal reply objects → Facebook Send API payload.
@@ -16,34 +21,22 @@ const VERIFY_TOKEN = process.env.FB_VERIFY_TOKEN || "";
  * or already-FB-shaped objects containing {text} or {attachment}.
  */
 function toFbMessage(r) {
-  // Plain string
-  if (typeof r === "string") return { text: r };
+  if (typeof r === "string") return { text: r };           // plain string
+  if (r && (r.text || r.attachment)) return r;             // already FB-shaped
 
-  // Already a valid FB payload
-  if (r && (r.text || r.attachment)) return r;
-
-  // Structured types we use
-  if (r?.type === "text") {
-    return { text: r.text || "" };
-  }
+  if (r?.type === "text") return { text: r.text || "" };
 
   if (r?.type === "buttons") {
     const buttons = (r.buttons || []).map((b) => {
       if (b.type === "web_url" || b.type === "url") {
         return { type: "web_url", title: b.title, url: b.url };
       }
-      // default to postback
       return { type: "postback", title: b.title, payload: b.payload || b.title || "BTN_CLICK" };
     });
-
     return {
       attachment: {
         type: "template",
-        payload: {
-          template_type: "button",
-          text: r.text || "Please choose:",
-          buttons,
-        },
+        payload: { template_type: "button", text: r.text || "Please choose:", buttons },
       },
     };
   }
@@ -52,25 +45,16 @@ function toFbMessage(r) {
     return {
       attachment: {
         type: "template",
-        payload: {
-          template_type: "generic",
-          elements: r.elements || [],
-        },
+        payload: { template_type: "generic", elements: r.elements || [] },
       },
     };
   }
 
   if (r?.type === "image") {
-    return {
-      attachment: {
-        type: "image",
-        payload: { url: r.url, is_reusable: true },
-      },
-    };
+    return { attachment: { type: "image", payload: { url: r.url, is_reusable: true } } };
   }
 
-  // Fallback
-  return { text: r?.text || "✅" };
+  return { text: r?.text || "✅" }; // safe fallback
 }
 
 export default async function handler(req, res) {
@@ -80,9 +64,7 @@ export default async function handler(req, res) {
       const mode = req.query["hub.mode"];
       const token = req.query["hub.verify_token"];
       const challenge = req.query["hub.challenge"];
-      if (mode === "subscribe" && token === VERIFY_TOKEN) {
-        return res.status(200).send(challenge);
-      }
+      if (mode === "subscribe" && token === VERIFY_TOKEN) return res.status(200).send(challenge);
       return res.status(403).send("Forbidden");
     }
 
@@ -99,21 +81,17 @@ export default async function handler(req, res) {
         const psid = evt.sender?.id;
         if (!psid) continue;
 
-        // Normalized text from user (message, postback title, fallback payload)
         const text =
           evt.message?.text ||
           evt.postback?.title ||
           evt.postback?.payload ||
           "";
 
-        // Collect attachments (e.g., images, files)
         const attachments = evt.message?.attachments || [];
-
-        // Load session
         let session = await getSession(psid);
 
         await sendTypingOn(psid);
-        resetNudge(session);
+        await resetNudge(session); // await to keep state consistent
 
         // ---- INTERRUPTS (FAQ, off-topic, objections) ----
         if (text) {
@@ -123,27 +101,29 @@ export default async function handler(req, res) {
             if (intr.resume) await sendMessage(psid, toFbMessage(intr.resume));
             await setSession(psid, session);
             await sendTypingOff(psid);
-            continue; // Stop here — do not move to normal flow
+            continue;
           }
         }
 
         // ---- MAIN ROUTER (LLM flow) ----
-        const { replies = [], newState } = await route({
+        if (typeof router !== "function") {
+          console.error("Router not resolved to a function. Got:", router);
+          await sendTypingOff(psid);
+          continue;
+        }
+
+        const { replies = [], newState } = await router({
           psid,
           text,
           attachments,
           state: session,
         });
 
-        // Send all replies (convert to FB message if needed)
         for (const r of replies) {
           await sendMessage(psid, toFbMessage(r));
         }
 
-        // Nudges (optional follow-up prompts if user stops replying)
         await checkNudge(newState, (t) => sendMessage(psid, toFbMessage(t)));
-
-        // Save session
         await setSession(psid, newState);
 
         await sendTypingOff(psid);
