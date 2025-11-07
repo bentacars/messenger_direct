@@ -1,68 +1,66 @@
 // server/lib/nudges.js
 // Auto follow-up nudges for idle users
-// Runs every 15 minutes (router calls checkNudge on each webhook event)
+// router calls checkNudge(newState, (t) => sendMessage(psid, toFbMessage(t)))
 
-const ATTEMPT_LIMIT = 8;             // Max nudges per phase
+const ATTEMPT_LIMIT = 8;                  // Max nudges per phase
 const NUDGE_INTERVAL_MS = 15 * 60 * 1000; // 15 minutes
-const QUIET_HOURS = { start: 21, end: 9 }; // 9PM - 9AM PH time
+const QUIET_HOURS = { start: 21, end: 9 };// 9PM–9AM Asia/Manila
 
 function inQuietHours() {
   const now = new Date();
-  const phHour = now.getUTCHours() + 8; // Asia/Manila = UTC+8
-  const h = (phHour + 24) % 24;
-  return h >= QUIET_HOURS.start || h < QUIET_HOURS.end;
+  const phHour = (now.getUTCHours() + 8 + 24) % 24; // Asia/Manila = UTC+8
+  return phHour >= QUIET_HOURS.start || phHour < QUIET_HOURS.end;
 }
 
-export async function checkNudge(session, sendMessage) {
-  const phase = session.phase || "phase1";
-  const n = session.nudge || {};
+/**
+ * checkNudge(state, send)
+ * - state: your session object (mutated here to track nudge attempts)
+ * - send:  (text) => Promise<void>  — webhook passes a wrapper that already formats to FB
+ */
+export async function checkNudge(state = {}, send) {
+  const phase = state.phase || "qualifying";
+  const n = state.nudge || {};
   const now = Date.now();
 
-  // Only Phase 1 & Phase 3 get nudges
-  if (phase !== "phase1" && phase !== "cash" && phase !== "financing") return;
+  // Only nudge during these phases
+  if (phase !== "qualifying" && phase !== "cash" && phase !== "financing") return;
 
   const last = n.lastTs || 0;
   const count = n.count || 0;
 
-  if (count >= ATTEMPT_LIMIT) return; // already max
+  if (count >= ATTEMPT_LIMIT) return;              // reached the cap
+  if (now - last < NUDGE_INTERVAL_MS) return;      // too soon
+  if (inQuietHours()) return;                       // respect quiet hours
 
-  // Time since last nudge
-  if (now - last < NUDGE_INTERVAL_MS) return;
-
-  // Check quiet hours
-  if (inQuietHours()) return;
-
-  // Build message
+  // Compose message per phase
   let text = "Still there? 🙂";
-  if (phase === "phase1") {
-    text = [
-      "Sige, quick one lang — cash or financing ang plan mo?",
+  if (phase === "qualifying") {
+    const prompts = [
+      "Cash or financing ang plan mo?",
       "Location mo po? Para ma-match ko sa pinakamalapit.",
-      "Auto or manual ang prefer mo? Pwede rin ‘any’ 🙂",
-      "Magkano target budget mo? (SRP or cash-out)"
-    ][count % 4];
+      "Auto or manual prefer mo? Pwede rin ‘any’.",
+      "Magkano comfortable na budget mo? (SRP or cash-out)",
+    ];
+    text = prompts[count % prompts.length];
   } else if (phase === "cash") {
-    text = "Ready anytime if you wanna schedule viewing. 🙂";
+    text = "Pwede tayong mag-schedule ng viewing anytime. Sabihin mo lang. 🙂";
   } else if (phase === "financing") {
-    text = "Send mo lang kahit ID muna para ma-start ko pre-approval. 👍";
+    text = "Kahit valid ID muna, ma-start ko na ang pre-approval. 👍";
   }
 
-  // Final attempt
   if (count + 1 === ATTEMPT_LIMIT) {
-    text = "Pause muna ako. Want to continue or stop here?";
+    text = "Last ping ko muna. G gusto mong ituloy o stop na tayo dito?";
   }
 
-  await sendMessage(text);
+  if (typeof send === "function") {
+    await send(text);
+  }
 
-  // Update session
-  session.nudge = {
-    lastTs: now,
-    count: count + 1,
-  };
+  // Persist counters
+  state.nudge = { lastTs: now, count: count + 1 };
 }
 
-export function resetNudge(session) {
-  session.nudge = { lastTs: Date.now(), count: 0 };
+/** Reset nudge window whenever we receive a fresh user event */
+export function resetNudge(state = {}) {
+  state.nudge = { lastTs: Date.now(), count: 0 };
 }
-
-export default { checkNudge, resetNudge };
