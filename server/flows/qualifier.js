@@ -1,18 +1,18 @@
 // server/flows/qualifier.js
-// Full-LLM, human-style qualifier logic (AAL). Model writes the message.
-// This module only defines: slots helpers + the LLM "plan" call.
+// Full-LLM, human-style qualifier logic (AAL). The model writes the message.
+// Exports helpers + the LLM planner. ESM module.
 
 import { askLLM } from "../lib/ai.js";
 
-// --- normalize tricky budget phrasings into a single number (upper bound) ---
+// --- Normalize tricky budget phrasings into a single number (upper bound) ---
 function normalizeBudget(raw = "") {
   if (!raw) return "";
   let s = String(raw).trim().toLowerCase();
 
-  // replace commas/spaces
+  // remove commas/spaces
   s = s.replace(/[, ]+/g, "");
 
-  // k/m suffixes
+  // k / m suffixes
   s = s.replace(/(\d+(?:\.\d+)?)m\b/g, (_, n) => String(Math.round(parseFloat(n) * 1_000_000)));
   s = s.replace(/(\d+(?:\.\d+)?)k\b/g, (_, n) => String(Math.round(parseFloat(n) * 1_000)));
 
@@ -36,7 +36,7 @@ function normalizeBudget(raw = "") {
   return "";
 }
 
-/** The slots we care about (not a rigid order). */
+/** Slots we care about (any order). */
 export const SLOT_KEYS = [
   "payment",       // "cash" | "financing"
   "budget",        // digits only (PHP cash price or cash-out if implied)
@@ -46,13 +46,13 @@ export const SLOT_KEYS = [
   "brand", "model", "variant", "year" // optional prefs
 ];
 
-export const REQUIRED_CORE = ["payment","budget","bodyType","transmission","location"];
+export const REQUIRED_CORE = ["payment", "budget", "bodyType", "transmission", "location"];
 
 export function hasAllCore(slots = {}) {
   return REQUIRED_CORE.every(k => slots[k] && String(slots[k]).trim() !== "");
 }
 
-/** Merge, without overwriting already-confirmed info unless new value is non-empty. */
+/** Merge without overwriting confirmed info unless new value is non-empty. */
 export function mergeSlots(prev = {}, patch = {}) {
   const out = { ...prev };
   for (const k of SLOT_KEYS) {
@@ -60,16 +60,18 @@ export function mergeSlots(prev = {}, patch = {}) {
     if (v === undefined || v === null || String(v).trim() === "") continue;
     if (!out[k] || String(out[k]).trim() === "") out[k] = v;
   }
- // sanitize budget
-if (out.budget) {
-  out.budget = normalizeBudget(out.budget);
+  // sanitize budget
+  if (out.budget) {
+    out.budget = normalizeBudget(out.budget);
+  }
+  return out;
 }
 
 /** Quick human summary for continuity lines. */
 export function summarizeSlots(slots = {}) {
   const parts = [];
   if (slots.payment) parts.push(slots.payment);
-  if (slots.budget)  parts.push(`~₱${Number(slots.budget).toLocaleString()}`);
+  if (slots.budget) parts.push(`~₱${Number(slots.budget).toLocaleString()}`);
   if (slots.bodyType) parts.push(slots.bodyType);
   if (slots.transmission) parts.push(slots.transmission);
   if (slots.location) parts.push(slots.location);
@@ -78,32 +80,33 @@ export function summarizeSlots(slots = {}) {
   return parts.join(", ");
 }
 
-/** “Good enough” rule to jump to matching even if not all slots are filled. */
+/** “Good enough” heuristic (not used when you enforce ALL core). */
 export function isGoodEnough(slots = {}) {
   const hasPayment = !!slots.payment;
   const strongPref = !!(slots.brand || slots.model);
-  const core = ["budget","bodyType","transmission","location"].reduce((n,k)=>n + (slots[k] ? 1 : 0), 0);
+  const core = ["budget", "bodyType", "transmission", "location"]
+    .reduce((n, k) => n + (slots[k] ? 1 : 0), 0);
   return (hasPayment && core >= 2) || (hasPayment && strongPref) || core >= 3;
 }
 
 /**
- * Full LLM planner:
- *   Input: userText + current state snapshot
- *   Output JSON:
- *   {
- *     reply_text: "string",            // the exact human response to send (AAL tone, 1–2 lines)
- *     updated_slots: { ... },          // only what the user clearly gave this turn
- *     ask_next: "payment|budget|bodyType|transmission|location|null",
- *     proceed_to_matching: boolean,    // model thinks it's enough — we’ll still apply our guard
- *     rephrase_reason: "string?"       // why it chose that wording (for anti-loop hints)
- *   }
+ * LLM planner:
+ * Input: userText + current snapshot
+ * Output STRICT JSON:
+ * {
+ *   reply_text: "string (<=2 lines, Taglish, AAL)",
+ *   updated_slots: { ...only explicit info... },
+ *   ask_next: "payment|budget|bodyType|transmission|location|null",
+ *   proceed_to_matching: boolean,
+ *   rephrase_reason: "string?"
+ * }
  */
 export async function planWithLLM({ userText = "", slots = {}, lastAsk = null, history = "" }) {
   const sys = `
 You are a friendly, professional Taglish car sales consultant for BentaCars (Philippines).
 Goal: Help naturally, keep rapport, and gather just enough info to match good units fast.
 Never sound like a checklist. Ask ONE best next question only when needed.
-Always acknowledge the user's message (Acknowledge → Ask → tiny Light warmth).
+Always acknowledge the user's message (Acknowledge → Ask → tiny light warmth).
 Keep replies short (1–2 lines). Avoid emoji spam.
 
 Qualifiers to collect organically (any order): payment, budget, bodyType, transmission, location.
@@ -145,7 +148,7 @@ ${fewshot}
 Return STRICT JSON only with:
 {
   "reply_text": "string (<= 2 lines, Taglish, AAL, no checklist)",
-  "updated_slots": { ... only explicit info ... },
+  "updated_slots": { },
   "ask_next": "payment|budget|bodyType|transmission|location|null",
   "proceed_to_matching": true|false,
   "rephrase_reason": "string (optional)"
@@ -153,10 +156,9 @@ Return STRICT JSON only with:
 `;
 
   try {
-    // Ask model to produce parseable JSON
     const plan = await askLLM(prompt, { json: true });
-    // Hard sanity guards
     if (!plan || typeof plan !== "object") throw new Error("Bad plan");
+
     if (plan.updated_slots && typeof plan.updated_slots !== "object") plan.updated_slots = {};
     if (!("ask_next" in plan)) plan.ask_next = null;
     if (!("proceed_to_matching" in plan)) plan.proceed_to_matching = false;
@@ -166,17 +168,17 @@ Return STRICT JSON only with:
     }
     // sanitize budget if present
     if (plan.updated_slots?.budget) {
-      plan.updated_slots.budget = String(plan.updated_slots.budget).replace(/[^\d]/g, "");
+      plan.updated_slots.budget = normalizeBudget(plan.updated_slots.budget);
     }
     return plan;
-  } catch (e) {
-    // Fallback minimal plan (rare)
+  } catch {
+    // Minimal, human fallback if LLM errors
     return {
       reply_text: "Sige, tutulungan kita—ano mas practical sayo: budget range or location muna?",
       updated_slots: {},
       ask_next: "budget",
       proceed_to_matching: false,
-      rephrase_reason: "fallback",
+      rephrase_reason: "fallback"
     };
   }
 }
