@@ -1,38 +1,39 @@
-// api/debug-imports.js
+// /api/debug-imports.js
 export const config = { runtime: "nodejs" };
 
-async function probe(path) {
+/** ESM-safe dynamic import using file URLs */
+async function probe(relPath) {
   try {
-    const m = await import(path);
-    const keys = Object.keys(m);
-    return { module: path, ok: true, keys };
+    const url = new URL(relPath, import.meta.url);   // resolve to file:// path
+    const mod = await import(url.href);              // ESM-friendly
+    return { module: relPath, ok: true, keys: Object.keys(mod) };
   } catch (e) {
     return {
-      module: path,
+      module: relPath,
       ok: false,
       error: String(e?.message || e),
-      stack: e?.stack?.split("\n").slice(0, 4).join(" | "),
+      stack: (e?.stack || "").split("\n").slice(0, 4).join(" | "),
     };
   }
 }
 
 export default async function handler(req, res) {
-  const base = "../server";
   const mods = [
-    `${base}/lib/ai.js`,
-    `${base}/lib/interrupts.js`,
-    `${base}/lib/messenger.js`,
-    `${base}/flows/qualifier.js`,
-    `${base}/flows/router.js`,
-    `${base}/flows/cash.js`,
-    `${base}/flows/financing.js`,
-    `${base}/lib/nudges.js`,
+    "../server/lib/ai.js",
+    "../server/lib/interrupts.js",
+    "../server/lib/messenger.js",
+    "../server/flows/qualifier.js",
+    "../server/flows/router.js",
+    "../server/flows/cash.js",
+    "../server/flows/financing.js",
+    "../server/lib/nudges.js",
   ];
+
   const results = [];
   for (const m of mods) results.push(await probe(m));
 
-  // also verify the router exports specifically
-  const r = await probe(`${base}/flows/router.js`);
+  // Also echo what router exports specifically (helpful sanity)
+  const r = await probe("../server/flows/router.js");
   results.push({ module: "router exports", ok: r.ok, keys: r.keys });
 
   res.status(200).json({ results, failed: results.filter(x => !x.ok).length });
