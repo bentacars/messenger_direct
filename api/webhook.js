@@ -3,7 +3,8 @@ export const config = { runtime: "nodejs" };
 
 import { getSession, setSession } from "../server/lib/session.js";
 import { sendTypingOn, sendTypingOff, sendMessage } from "../server/lib/messenger.js";
-import { route } from "../server/flows/router.js";
+import * as Router from "../server/flows/router.js";
+const route = Router.route || Router.router || Router.default;
 import { handleInterrupts } from "../server/lib/interrupts.js";
 import { checkNudge, resetNudge } from "../server/lib/nudges.js";
 
