@@ -1,25 +1,8 @@
 // /api/debug-imports.js
 export const config = { runtime: "nodejs" };
 
-/**
- * ✅ STATIC IMPORTS (forces Vercel to bundle the files)
- *    Without these, Vercel may tree-shake modules and they can't be imported at runtime.
- */
-import "../server/lib/ai.js";
-import "../server/lib/interrupts.js";
-import "../server/lib/messenger.js";
-import "../server/flows/qualifier.js";
-import "../server/flows/router.js";
-import "../server/flows/cash.js";
-import "../server/flows/financing.js";
-import "../server/lib/nudges.js";
-
-/**
- * ✅ MAIN DEBUG HANDLER
- *    Tries to dynamically import every module and returns an ok/error report.
- */
 export default async function handler(req, res) {
-  const modulesToTest = [
+  const mods = [
     "../server/lib/ai.js",
     "../server/lib/interrupts.js",
     "../server/lib/messenger.js",
@@ -31,22 +14,35 @@ export default async function handler(req, res) {
   ];
 
   const results = [];
-
-  for (const m of modulesToTest) {
+  for (const m of mods) {
     try {
-      await import(m);
-      results.push({ module: m, ok: true });
-    } catch (err) {
+      // dynamic import so we can catch module-level errors cleanly
+      const mod = await import(m);
+      results.push({
+        module: m,
+        ok: true,
+        keys: Object.keys(mod || {}),
+        // if router is CJS-shaped, surface its shape to verify
+        note:
+          m.includes("/router.js") && mod
+            ? `router: ${typeof mod.router}, default: ${typeof mod.default}`
+            : undefined,
+      });
+    } catch (e) {
       results.push({
         module: m,
         ok: false,
-        error: err?.message || String(err),
+        error: String(e && e.message),
+        stack:
+          e && e.stack
+            ? e.stack.split("\n").slice(0, 3).join(" | ")
+            : undefined,
       });
     }
   }
 
   return res.status(200).json({
     results,
-    failed: results.filter(r => !r.ok).length,
+    failed: results.filter((r) => !r.ok).length,
   });
 }
