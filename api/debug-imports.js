@@ -1,19 +1,8 @@
-// /api/debug-imports.js
+// api/debug-imports.js
 export const config = { runtime: "nodejs" };
 
-/** Safely import a module using a file:// URL and report its exported keys. */
-async function probe(relPath) {
-  try {
-    const url = new URL(relPath, import.meta.url);        // resolve to absolute file URL
-    const mod = await import(url.href);                   // dynamic import, but explicit path
-    return { module: relPath, ok: true, keys: Object.keys(mod) };
-  } catch (e) {
-    return { module: relPath, ok: false, error: String(e?.message || e) };
-  }
-}
-
-export default async function handler(_req, res) {
-  const targets = [
+export default async function handler(req, res) {
+  const modules = [
     "../server/lib/ai.js",
     "../server/lib/interrupts.js",
     "../server/lib/messenger.js",
@@ -25,21 +14,27 @@ export default async function handler(_req, res) {
   ];
 
   const results = [];
-  for (const p of targets) results.push(await probe(p));
-
-  // small hint about router shape (helps webhook import interop)
-  try {
-    const url = new URL("../server/flows/router.js", import.meta.url);
-    const r = await import(url.href);
-    results.push({
-      module: "router exports",
-      ok: true,
-      note: `router:${typeof r.router}, default:${typeof r.default}, keys:${Object.keys(r).join(",")}`,
-    });
-  } catch (e) {
-    results.push({ module: "router exports", ok: false, error: String(e?.message || e) });
+  for (const m of modules) {
+    try {
+      const mod = await import(m);
+      results.push({ module: m, ok: true, keys: Object.keys(mod) });
+    } catch (e) {
+      results.push({ module: m, ok: false, error: String(e).split("\n")[0] });
+    }
   }
 
-  const failed = results.filter(r => !r.ok).length;
-  res.status(200).json({ results, failed });
+  // Extra check: does router expose a callable "route"?
+  try {
+    const r = await import("../server/flows/router.js");
+    const route = r.route || r.router || r.default;
+    results.push({
+      module: "router exports",
+      ok: typeof route === "function",
+      keys: Object.keys(r),
+    });
+  } catch (e) {
+    results.push({ module: "router exports", ok: false, error: String(e).split("\n")[0] });
+  }
+
+  return res.status(200).json({ results, failed: results.filter(r => !r.ok).length });
 }
